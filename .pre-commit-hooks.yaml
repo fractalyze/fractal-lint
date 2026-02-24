@@ -1,0 +1,6 @@
+- id: fractal-lint
+  name: fractal-lint
+  entry: fractal-lint
+  language: python
+  types_or: [c, c++]
+  description: Custom style linter for ZKX
