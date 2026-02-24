@@ -269,22 +269,34 @@ def _find_pointer_members(
     return results
 
 
-def _compute_scope_info(lines: list[str]) -> list[tuple[bool, bool, int]]:
-    """For each line, compute (in_anonymous_ns, in_class, brace_depth).
+def _compute_scope_info(
+    lines: list[str],
+) -> list[tuple[bool, bool, int, int]]:
+    """For each line, compute (in_anonymous_ns, in_class, brace_depth, ns_depth).
+
+    ns_depth tracks how many namespace braces are open, so
+    ``brace_depth == ns_depth`` means the line is at namespace scope
+    (not inside a function or class body).
 
     Returns a list parallel to lines.
     """
     info = []
     brace_depth = 0
+    ns_depth = 0
     anon_ns_depth = None
     class_depth = None
+    # Stack of brace depths where namespaces were opened.
+    ns_stack: list[int] = []
 
     for line in lines:
         stripped = line.strip()
 
-        # Detect anonymous namespace start.
-        if re.match(r"^namespace\s*\{", stripped):
-            anon_ns_depth = brace_depth
+        # Detect namespace start (named or anonymous).
+        ns_match = re.match(r"^namespace\b", stripped)
+        if ns_match and "{" in line:
+            if re.match(r"^namespace\s*\{", stripped):
+                anon_ns_depth = brace_depth
+            ns_stack.append(brace_depth)
 
         # Detect class/struct start.
         if class_depth is None:
@@ -297,7 +309,8 @@ def _compute_scope_info(lines: list[str]) -> list[tuple[bool, bool, int]]:
 
         in_anon = anon_ns_depth is not None and brace_depth > anon_ns_depth
         in_cls = class_depth is not None and brace_depth > class_depth
-        info.append((in_anon, in_cls, brace_depth))
+        ns_depth = len(ns_stack)
+        info.append((in_anon, in_cls, brace_depth, ns_depth))
 
         # Update brace depth.
         brace_depth += line.count("{") - line.count("}")
@@ -307,6 +320,9 @@ def _compute_scope_info(lines: list[str]) -> list[tuple[bool, bool, int]]:
             anon_ns_depth = None
         if class_depth is not None and brace_depth <= class_depth:
             class_depth = None
+        # Pop namespace stack when its brace closes.
+        while ns_stack and brace_depth <= ns_stack[-1]:
+            ns_stack.pop()
 
     return info
 
@@ -522,7 +538,7 @@ def check_static_annotation(filepath: str, lines: list[str]) -> list[Diagnostic]
         if _is_suppressed(lines, i, rule):
             continue
         stripped = line.strip()
-        _, in_cls, _ = scope_info[i]
+        _, in_cls, _, _ = scope_info[i]
         if in_cls:
             continue
 
@@ -615,11 +631,14 @@ def check_file_scope_static(filepath: str, lines: list[str]) -> list[Diagnostic]
         if stripped.startswith("//") or stripped.startswith("/*"):
             continue
 
-        in_anon, in_cls, _ = scope_info[i]
+        in_anon, in_cls, bdepth, nsdepth = scope_info[i]
 
         # Only flag static at namespace scope (not in anonymous namespace,
-        # not in class).
+        # not in class, not inside a function body).
         if in_anon or in_cls:
+            continue
+        # Inside a function body: brace_depth exceeds namespace depth.
+        if bdepth > nsdepth:
             continue
 
         if static_pat.match(stripped):
