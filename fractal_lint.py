@@ -490,7 +490,7 @@ def check_redundant_include(
                     file=filepath,
                     line=line_idx + 1,
                     rule=rule,
-                    message=f'Redundant #include "{inc}" (already in header)',
+                    message=f'Redundant #include "{inc}" (already in {os.path.basename(header_path)})',
                 )
             )
             if fix:
