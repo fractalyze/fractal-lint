@@ -246,13 +246,19 @@ def _find_pointer_members(
                         continue
                     if any(type_name.startswith(sp) for sp in smart_ptrs):
                         continue
-                    # Check for ownership comment on same line.
-                    if "// not owned" in line or "// owned" in line:
+
+                    # Check for ownership comment on same or previous line.
+                    # Accept any comment containing ownership-related words.
+                    def _has_ownership_comment(text: str) -> bool:
+                        comment_start = text.find("//")
+                        if comment_start < 0:
+                            return False
+                        comment = text[comment_start:].lower()
+                        return "owned" in comment or "owns" in comment
+
+                    if _has_ownership_comment(line):
                         continue
-                    # Check for ownership comment on previous line.
-                    if i > 0 and (
-                        "// not owned" in lines[i - 1] or "// owned" in lines[i - 1]
-                    ):
+                    if i > 0 and _has_ownership_comment(lines[i - 1]):
                         continue
                     results.append((i, stripped))
 
