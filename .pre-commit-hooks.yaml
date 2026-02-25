@@ -4,3 +4,11 @@
   language: python
   types_or: [c, c++]
   description: Custom style linter for ZKX
+
+- id: fractal-commit-lint
+  name: fractal-commit-lint
+  entry: fractal-commit-lint
+  language: python
+  always_run: true
+  stages: [commit-msg]
+  description: Commit message linter enforcing Conventional Commits
