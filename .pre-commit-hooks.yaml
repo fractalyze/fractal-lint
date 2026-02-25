@@ -12,3 +12,10 @@
   always_run: true
   stages: [commit-msg]
   description: Commit message linter enforcing Conventional Commits
+
+- id: fractal-build-lint
+  name: fractal-build-lint
+  entry: fractal-build-lint --fix
+  language: python
+  files: (BUILD\.bazel|BUILD)$
+  description: BUILD.bazel linter enforcing target sorting and naming
