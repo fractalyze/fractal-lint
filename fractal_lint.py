@@ -669,8 +669,11 @@ def check_static_annotation(filepath: str, lines: list[str]) -> list[Diagnostic]
         if _is_suppressed(lines, i, rule):
             continue
         stripped = line.strip()
-        _, in_cls, _, _ = scope_info[i]
+        _, in_cls, bdepth, nsdepth = scope_info[i]
         if in_cls:
+            continue
+        # Skip lines inside function bodies (calls, not definitions).
+        if bdepth > nsdepth:
             continue
 
         for qualified in static_set:
@@ -686,8 +689,22 @@ def check_static_annotation(filepath: str, lines: list[str]) -> list[Diagnostic]
             if prefix.startswith("return"):
                 continue
 
+            # Walk backwards past blank lines and return-type lines to find
+            # "// static".  Return-type lines are non-empty lines that don't
+            # end with ; { } and aren't "// static" themselves.
             has_static_comment = False
             j = i - 1
+            while j >= 0 and lines[j].strip() == "":
+                j -= 1
+            # Walk past multi-line return type (e.g. `absl::StatusOr<...>\n`).
+            while (
+                j >= 0
+                and lines[j].strip() != "// static"
+                and lines[j].strip()
+                and lines[j].strip()[-1] not in (";", "{", "}")
+            ):
+                j -= 1
+            # Skip blank lines again.
             while j >= 0 and lines[j].strip() == "":
                 j -= 1
             if j >= 0 and lines[j].strip() == "// static":
