@@ -247,8 +247,17 @@ def _find_pointer_members(
                     if any(type_name.startswith(sp) for sp in smart_ptrs):
                         continue
 
-                    # Check for ownership comment on same or previous line.
-                    # Accept any comment containing ownership-related words.
+                    # Check for any trailing comment on same line, previous
+                    # line, or continuation line.  Any comment is treated as
+                    # sufficient documentation (the developer has already
+                    # annotated the member).
+                    def _has_comment(text: str) -> bool:
+                        return (
+                            "//" in text[text.find(";") + 1 :]
+                            if ";" in text
+                            else "//" in text
+                        )
+
                     def _has_ownership_comment(text: str) -> bool:
                         comment_start = text.find("//")
                         if comment_start < 0:
@@ -256,12 +265,15 @@ def _find_pointer_members(
                         comment = text[comment_start:].lower()
                         return "owned" in comment or "owns" in comment
 
-                    if _has_ownership_comment(line):
+                    if _has_ownership_comment(line) or _has_comment(line):
                         continue
                     if i > 0 and _has_ownership_comment(lines[i - 1]):
                         continue
                     # Check continuation line (e.g. `T* p_ =\n  nullptr; // not owned`).
                     if i + 1 < len(lines) and _has_ownership_comment(lines[i + 1]):
+                        continue
+                    # Check continuation line for any comment.
+                    if i + 1 < len(lines) and _has_comment(lines[i + 1]):
                         continue
                     results.append((i, stripped))
 
