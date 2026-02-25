@@ -260,6 +260,9 @@ def _find_pointer_members(
                         continue
                     if i > 0 and _has_ownership_comment(lines[i - 1]):
                         continue
+                    # Check continuation line (e.g. `T* p_ =\n  nullptr; // not owned`).
+                    if i + 1 < len(lines) and _has_ownership_comment(lines[i + 1]):
+                        continue
                     results.append((i, stripped))
 
         # Update brace depth.
@@ -367,10 +370,114 @@ def check_abseil_string_view(
     return diags, new_lines
 
 
-def check_nolint_type(filepath: str, lines: list[str]) -> list[Diagnostic]:
+def _query_clang_tidy_categories(
+    filepath: str, lines: list[str], nolint_lines: dict[int, str]
+) -> dict[int, str]:
+    """Run clang-tidy with NOLINTs stripped to discover actual categories.
+
+    Args:
+        filepath: Path to the source file.
+        lines: Original file lines.
+        nolint_lines: {0-based line index: NOLINT variant} for bare NOLINTs.
+
+    Returns:
+        {0-based line index: comma-separated categories} for each NOLINT line.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    if not shutil.which("clang-tidy"):
+        return {}
+
+    # Build a version of the file with bare NOLINTs stripped so clang-tidy
+    # can report the actual warnings.
+    bare_nolint_re = re.compile(r"NOLINT(NEXTLINE|BEGIN|END)?\b(?!\()")
+    stripped = list(lines)
+    for idx in nolint_lines:
+        stripped[idx] = bare_nolint_re.sub("", stripped[idx])
+
+    # Write to a temp file preserving the extension.
+    ext = os.path.splitext(filepath)[1] or ".cc"
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=ext, delete=False, encoding="utf-8"
+    ) as tmp:
+        tmp.write("\n".join(stripped))
+        if lines:
+            tmp.write("\n")
+        tmp_path = tmp.name
+
+    try:
+        # Look for compile_commands.json near the file.
+        compile_db_args: list[str] = []
+        search = os.path.dirname(os.path.abspath(filepath))
+        for _ in range(10):
+            if os.path.isfile(os.path.join(search, "compile_commands.json")):
+                compile_db_args = ["-p", search]
+                break
+            parent = os.path.dirname(search)
+            if parent == search:
+                break
+            search = parent
+
+        result = subprocess.run(
+            [
+                "clang-tidy",
+                tmp_path,
+                "--quiet",
+                "--checks=*",
+                *compile_db_args,
+                "--",
+                "-std=c++17",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        output = result.stdout + result.stderr
+    except (subprocess.TimeoutExpired, OSError):
+        return {}
+    finally:
+        os.unlink(tmp_path)
+
+    # Parse clang-tidy output: "file:line:col: warning: ... [category]"
+    ct_pat = re.compile(r":(\d+):\d+: (?:warning|error): .+\[([^\]]+)\]")
+    # Prefixes that are noise for most projects (not in .clang-tidy configs).
+    _NOISE_PREFIXES = ("llvmlibc-", "altera-", "fuchsia-")
+    # Map: warning_line (1-based) → set of categories.
+    line_cats: dict[int, set[str]] = {}
+    for m in ct_pat.finditer(output):
+        wline = int(m.group(1))
+        # A single [a,b] group may contain multiple comma-separated checks.
+        for cat in m.group(2).split(","):
+            if any(cat.startswith(p) for p in _NOISE_PREFIXES):
+                continue
+            line_cats.setdefault(wline, set()).add(cat)
+
+    # Match warnings back to NOLINT lines.
+    result_map: dict[int, str] = {}
+    for idx, variant in nolint_lines.items():
+        # NOLINT on same line → warning on same line (1-based = idx+1).
+        # NOLINTNEXTLINE → warning on next line (1-based = idx+2).
+        if "NEXTLINE" in variant:
+            target_line = idx + 2
+        else:
+            target_line = idx + 1
+
+        cats = line_cats.get(target_line)
+        if cats:
+            result_map[idx] = ",".join(sorted(cats))
+
+    return result_map
+
+
+def check_nolint_type(
+    filepath: str, lines: list[str], fix: bool
+) -> tuple[list[Diagnostic], list[str]]:
     """Rule: nolint-type — NOLINT must include (category)."""
     rule = "nolint-type"
     diags = []
+    new_lines = list(lines)
 
     # Match NOLINT, NOLINTNEXTLINE, NOLINTBEGIN, NOLINTEND not followed by (.
     # Word boundary \b prevents matching "NOLINT" inside "NOLINTNEXTLINE".
@@ -378,13 +485,15 @@ def check_nolint_type(filepath: str, lines: list[str]) -> list[Diagnostic]:
     # Also match the colon form: NOLINT: something (should use parentheses).
     colon_pat = re.compile(r"NOLINT(NEXTLINE|BEGIN|END)?\b\s*:")
 
+    # {0-based index: matched NOLINT variant string} for bare NOLINTs.
+    bare_nolint_lines: dict[int, str] = {}
+
     for i, line in enumerate(lines):
         if _is_suppressed(lines, i, rule):
             continue
         # Only check inside comments.
         comment_start = line.find("//")
         if comment_start < 0:
-            # Check block comment start on this line.
             comment_start = line.find("/*")
         if comment_start < 0:
             continue
@@ -403,6 +512,9 @@ def check_nolint_type(filepath: str, lines: list[str]) -> list[Diagnostic]:
                 )
             )
         elif pat.search(comment):
+            m = pat.search(comment)
+            variant = "NOLINT" + (m.group(1) or "")
+            bare_nolint_lines[i] = variant
             diags.append(
                 Diagnostic(
                     file=filepath,
@@ -415,7 +527,20 @@ def check_nolint_type(filepath: str, lines: list[str]) -> list[Diagnostic]:
                 )
             )
 
-    return diags
+    if fix and bare_nolint_lines:
+        # Query clang-tidy for actual categories.
+        categories = _query_clang_tidy_categories(filepath, lines, bare_nolint_lines)
+        bare_re = re.compile(r"NOLINT(NEXTLINE|BEGIN|END)?\b(?!\()")
+        for idx in bare_nolint_lines:
+            cat = categories.get(idx)
+            if cat:
+                repl = lambda m, c=cat: m.group(0) + f"({c})"
+            else:
+                # Fallback: use (*) if clang-tidy didn't report a category.
+                repl = lambda m: m.group(0) + "(*)"
+            new_lines[idx] = bare_re.sub(repl, new_lines[idx], count=1)
+
+    return diags, new_lines
 
 
 def check_license_header(filepath: str, lines: list[str]) -> list[Diagnostic]:
@@ -734,9 +859,10 @@ def lint_file(
         diags, current_lines = check_abseil_string_view(filepath, current_lines, fix)
         all_diags.extend(diags)
 
-    # --- nolint-type ---
+    # --- nolint-type (fixable via clang-tidy) ---
     if "nolint-type" in rules:
-        all_diags.extend(check_nolint_type(filepath, current_lines))
+        diags, current_lines = check_nolint_type(filepath, current_lines, fix)
+        all_diags.extend(diags)
 
     # --- license-header ---
     if "license-header" in rules:
