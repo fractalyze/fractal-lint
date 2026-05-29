@@ -97,11 +97,14 @@ class ScopeConfig:
     may touch. exempt_paths are prefixes ignored by the scope-path check
     (cross-cutting files like WORKSPACE or vendored third_party trees).
     require_scope makes a scope mandatory on every conventional commit.
+    require_deepest_scope rejects a covering scope when a strictly more
+    specific declared scope also covers every file (scope-too-broad).
     """
 
     scopes: dict[str, list[str]]
     exempt_paths: list[str]
     require_scope: bool
+    require_deepest_scope: bool = True
 
 
 def _as_prefix_list(value) -> list[str]:
@@ -138,6 +141,7 @@ def load_scope_config(start_dir: str = ".") -> ScopeConfig | None:
         scopes=scopes,
         exempt_paths=_as_prefix_list(data.get("exempt_paths", [])),
         require_scope=bool(data.get("require_scope", False)),
+        require_deepest_scope=bool(data.get("require_deepest_scope", True)),
     )
 
 
@@ -162,6 +166,53 @@ def staged_files() -> list[str]:
 def _under_prefix(path: str, prefix: str) -> bool:
     prefix = prefix.rstrip("/")
     return path == prefix or path.startswith(prefix + "/")
+
+
+def _matching_prefix(prefixes: list[str], path: str) -> str | None:
+    """The most specific (longest) configured prefix that contains path."""
+    best = None
+    for p in prefixes:
+        if _under_prefix(path, p):
+            if best is None or len(p.rstrip("/")) > len(best.rstrip("/")):
+                best = p
+    return best
+
+
+def _covers(prefixes: list[str], files: list[str], exempt: list[str]) -> bool:
+    for f in files:
+        if any(_under_prefix(f, e) for e in exempt):
+            continue
+        if not any(_under_prefix(f, p) for p in prefixes):
+            return False
+    return True
+
+
+def _is_deeper(
+    cand: list[str],
+    chosen: list[str],
+    files: list[str],
+    exempt: list[str],
+) -> bool:
+    """True if cand is a strictly more specific cover of files than chosen.
+
+    For every (non-exempt) file the candidate's matching prefix must sit at or
+    below the chosen scope's matching prefix, and be strictly deeper for at
+    least one file.
+    """
+    strict = False
+    for f in files:
+        if any(_under_prefix(f, e) for e in exempt):
+            continue
+        cp = _matching_prefix(cand, f)
+        kp = _matching_prefix(chosen, f)
+        if cp is None or kp is None:
+            return False
+        cp, kp = cp.rstrip("/"), kp.rstrip("/")
+        if not _under_prefix(cp, kp):  # cand prefix must be inside chosen prefix
+            return False
+        if cp != kp:
+            strict = True
+    return strict
 
 
 def validate_scope(
@@ -211,6 +262,43 @@ def validate_scope(
                     message=(
                         f"file '{path}' is outside scope '{scope}' "
                         f"({', '.join(prefixes)})"
+                    ),
+                )
+            )
+    if diags:
+        return diags  # Scope does not even cover the files; depth is moot.
+
+    # --- scope-too-broad ---
+    # Among scopes that also cover every file, reject the chosen one if a
+    # strictly more specific declared scope exists.
+    if config.require_deepest_scope:
+        deeper = sorted(
+            name
+            for name, prefs in config.scopes.items()
+            if name != scope
+            and _covers(prefs, files, config.exempt_paths)
+            and _is_deeper(prefs, prefixes, files, config.exempt_paths)
+        )
+        # Suggest only the deepest candidates (those not themselves out-deepened).
+        deepest = [
+            name
+            for name in deeper
+            if not any(
+                _is_deeper(
+                    config.scopes[other], config.scopes[name], files, config.exempt_paths
+                )
+                for other in deeper
+                if other != name
+            )
+        ]
+        if deepest:
+            diags.append(
+                Diagnostic(
+                    line=1,
+                    rule="scope-too-broad",
+                    message=(
+                        f"scope '{scope}' is broader than necessary; all files "
+                        f"fit deeper scope: {', '.join(deepest)}"
                     ),
                 )
             )

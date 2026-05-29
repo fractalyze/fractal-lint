@@ -54,19 +54,22 @@ By default the `<scope>` is free-form — any text passes. Drop a
 # here is rejected; a file outside its scope's folders is rejected.
 exempt_paths = ["WORKSPACE", "third_party/"]  # cross-cutting, skipped by scope-path
 require_scope = false                          # set true to make scope mandatory
+require_deepest_scope = true                   # prefer the most specific scope (default)
 
 [scopes]
 hlo = "xla/hlo"
+evaluator = "xla/hlo/evaluator"
 cpu = ["xla/backends/cpu", "xla/service/cpu"]
 gpu = ["xla/backends/gpu", "xla/service/gpu", "xla/codegen"]
 ```
 
-This adds three rules, active only when the config file is present:
+This adds these rules, active only when the config file is present:
 
 | Rule | Description |
 | --- | --- |
 | `scope-enum` | `<scope>` must be a key in `[scopes]` |
 | `scope-path` | every staged file must live under one of the scope's prefixes (or `exempt_paths`) |
+| `scope-too-broad` | if a strictly more specific declared scope also covers every file, use it (e.g. a commit touching only `xla/hlo/evaluator/` must be `evaluator`, not `hlo`); disable with `require_deepest_scope = false` |
 | `scope-required` | a scope must be present (only when `require_scope = true`) |
 
 The staged set comes from `git diff --cached`; when it can't be resolved

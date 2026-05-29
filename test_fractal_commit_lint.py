@@ -115,6 +115,72 @@ class ScopePathTest(unittest.TestCase):
         self.assertEqual(rules(check(msg, CONFIG, [])), [])
 
 
+NESTED = fcl.ScopeConfig(
+    scopes={
+        "hlo": ["xla/hlo"],
+        "evaluator": ["xla/hlo/evaluator"],
+        "ir": ["xla/hlo/ir"],
+    },
+    exempt_paths=["WORKSPACE"],
+    require_scope=False,
+    require_deepest_scope=True,
+)
+
+
+class ScopeDeepestTest(unittest.TestCase):
+    def body(self, header):
+        return f"{header}\n\nA body that is long enough to pass the rule."
+
+    def test_too_broad_when_deeper_fits(self):
+        diags = check(
+            self.body("feat(hlo): tweak the evaluator"),
+            NESTED,
+            ["xla/hlo/evaluator/eval.cc"],
+        )
+        self.assertIn("scope-too-broad", rules(diags))
+
+    def test_message_suggests_deepest(self):
+        diags = check(
+            self.body("feat(hlo): tweak the evaluator"),
+            NESTED,
+            ["xla/hlo/evaluator/eval.cc"],
+        )
+        msg = next(d.message for d in diags if d.rule == "scope-too-broad")
+        self.assertIn("evaluator", msg)
+        self.assertNotIn("ir", msg)  # ir does not cover these files
+
+    def test_deepest_scope_passes(self):
+        diags = check(
+            self.body("feat(evaluator): tweak it"),
+            NESTED,
+            ["xla/hlo/evaluator/eval.cc"],
+        )
+        self.assertEqual(rules(diags), [])
+
+    def test_broad_scope_ok_when_files_span_subdirs(self):
+        # Files in both evaluator/ and ir/ — only hlo covers all, so hlo is fine.
+        diags = check(
+            self.body("feat(hlo): cross-cutting change"),
+            NESTED,
+            ["xla/hlo/evaluator/eval.cc", "xla/hlo/ir/instr.cc"],
+        )
+        self.assertEqual(rules(diags), [])
+
+    def test_opt_out_disables_too_broad(self):
+        cfg = fcl.ScopeConfig(
+            scopes=NESTED.scopes,
+            exempt_paths=NESTED.exempt_paths,
+            require_scope=False,
+            require_deepest_scope=False,
+        )
+        diags = check(
+            self.body("feat(hlo): tweak the evaluator"),
+            cfg,
+            ["xla/hlo/evaluator/eval.cc"],
+        )
+        self.assertEqual(rules(diags), [])
+
+
 class MergeAndRevertTest(unittest.TestCase):
     def test_merge_skipped(self):
         self.assertEqual(check("Merge branch 'main' into feature", CONFIG, ["x"]), [])
