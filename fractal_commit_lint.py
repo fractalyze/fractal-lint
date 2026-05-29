@@ -25,10 +25,11 @@ Usage:
 
 import argparse
 import os
+import posixpath
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 try:
     import tomllib  # Python 3.11+
@@ -93,18 +94,32 @@ def format_diagnostic(d: Diagnostic) -> str:
 class ScopeConfig:
     """Repo-local scope policy loaded from .fractal-commit-lint.toml.
 
-    scopes maps each allowed scope to the list of path prefixes its commits
-    may touch. exempt_paths are prefixes ignored by the scope-path check
-    (cross-cutting files like WORKSPACE or vendored third_party trees).
-    require_scope makes a scope mandatory on every conventional commit.
-    require_deepest_scope rejects a covering scope when a strictly more
-    specific declared scope also covers every file (scope-too-broad).
+    Two ways a scope resolves to the paths its commits may touch:
+
+    * directory mode (roots): a scope is any real directory under one of
+      `roots`. `feat(hlo/evaluator)` -> `xla/hlo/evaluator` when roots=["xla"].
+      No enumeration; a typo like `sevice` resolves to no directory and is
+      rejected. Directory scopes are deepest-checked: a directory scope that
+      is a strict ancestor of the changed files' common directory is rejected
+      (scope-too-broad).
+    * scopes (explicit exceptions): a curated name -> path-prefix(es) map for
+      things directory mode can't express — abbreviations (`se` ->
+      `xla/stream_executor`), root-level concept scopes (`primitive-types`),
+      and deliberate multi-directory groupings (`cpu` -> backends/cpu +
+      service/cpu). An explicit scope is blessed: it always satisfies the
+      deepest check, so a merged `cpu` is never asked to narrow.
+
+    exempt_paths are prefixes ignored by scope-path and deepest (cross-cutting
+    files like WORKSPACE or vendored third_party trees). require_scope makes a
+    scope mandatory. require_deepest_scope toggles the directory-mode depth
+    check.
     """
 
     scopes: dict[str, list[str]]
     exempt_paths: list[str]
     require_scope: bool
     require_deepest_scope: bool = True
+    roots: list[str] = field(default_factory=list)
 
 
 def _as_prefix_list(value) -> list[str]:
@@ -142,6 +157,7 @@ def load_scope_config(start_dir: str = ".") -> ScopeConfig | None:
         exempt_paths=_as_prefix_list(data.get("exempt_paths", [])),
         require_scope=bool(data.get("require_scope", False)),
         require_deepest_scope=bool(data.get("require_deepest_scope", True)),
+        roots=_as_prefix_list(data.get("roots", [])),
     )
 
 
@@ -168,57 +184,45 @@ def _under_prefix(path: str, prefix: str) -> bool:
     return path == prefix or path.startswith(prefix + "/")
 
 
-def _matching_prefix(prefixes: list[str], path: str) -> str | None:
-    """The most specific (longest) configured prefix that contains path."""
-    best = None
-    for p in prefixes:
-        if _under_prefix(path, p):
-            if best is None or len(p.rstrip("/")) > len(best.rstrip("/")):
-                best = p
-    return best
+def _strip_roots(path: str, roots: list[str]) -> str:
+    """Drop a leading root prefix so a directory maps back to a scope name."""
+    path = path.rstrip("/")
+    for r in roots:
+        r = r.rstrip("/")
+        if path == r:
+            return ""
+        if path.startswith(r + "/"):
+            return path[len(r) + 1:]
+    return path
 
 
-def _covers(prefixes: list[str], files: list[str], exempt: list[str]) -> bool:
-    for f in files:
-        if any(_under_prefix(f, e) for e in exempt):
-            continue
-        if not any(_under_prefix(f, p) for p in prefixes):
-            return False
-    return True
+def resolve_scope(
+    scope: str,
+    config: ScopeConfig,
+    is_dir,
+) -> tuple[list[str] | None, bool]:
+    """Resolve a scope to its path prefixes.
 
-
-def _is_deeper(
-    cand: list[str],
-    chosen: list[str],
-    files: list[str],
-    exempt: list[str],
-) -> bool:
-    """True if cand is a strictly more specific cover of files than chosen.
-
-    For every (non-exempt) file the candidate's matching prefix must sit at or
-    below the chosen scope's matching prefix, and be strictly deeper for at
-    least one file.
+    Returns (prefixes, explicit). explicit=True means the scope came from the
+    curated [scopes] map (blessed: exempt from the deepest check). A None
+    prefixes means the scope resolved to nothing (unknown scope).
     """
-    strict = False
-    for f in files:
-        if any(_under_prefix(f, e) for e in exempt):
-            continue
-        cp = _matching_prefix(cand, f)
-        kp = _matching_prefix(chosen, f)
-        if cp is None or kp is None:
-            return False
-        cp, kp = cp.rstrip("/"), kp.rstrip("/")
-        if not _under_prefix(cp, kp):  # cand prefix must be inside chosen prefix
-            return False
-        if cp != kp:
-            strict = True
-    return strict
+    if scope in config.scopes:
+        return config.scopes[scope], True
+    for r in config.roots:
+        cand = r.rstrip("/") + "/" + scope
+        if is_dir(cand):
+            return [cand], False
+    if is_dir(scope):
+        return [scope], False
+    return None, False
 
 
 def validate_scope(
     scope: str | None,
     config: ScopeConfig | None,
     files: list[str],
+    is_dir=os.path.isdir,
 ) -> list[Diagnostic]:
     """Validate the header scope against the repo scope policy."""
     if config is None:
@@ -227,33 +231,25 @@ def validate_scope(
     if not scope:
         if config.require_scope:
             return [
-                Diagnostic(
-                    line=1,
-                    rule="scope-required",
-                    message="a scope is required; expected one of: "
-                    + ", ".join(sorted(config.scopes)),
-                )
+                Diagnostic(line=1, rule="scope-required", message="a scope is required")
             ]
         return []
 
-    if scope not in config.scopes:
-        return [
-            Diagnostic(
-                line=1,
-                rule="scope-enum",
-                message=f"unknown scope '{scope}'; expected one of: "
-                + ", ".join(sorted(config.scopes)),
-            )
-        ]
+    prefixes, explicit = resolve_scope(scope, config, is_dir)
+    if prefixes is None:
+        hint = "a directory under " + ", ".join(config.roots) if config.roots else None
+        choices = ", ".join(sorted(config.scopes))
+        msg = f"unknown scope '{scope}'; expected "
+        msg += " or ".join(filter(None, [hint, f"one of: {choices}" if choices else ""]))
+        return [Diagnostic(line=1, rule="scope-enum", message=msg)]
 
-    prefixes = config.scopes[scope]
-    if not files or not prefixes:
-        return []
+    nonexempt = [
+        f for f in files if not any(_under_prefix(f, e) for e in config.exempt_paths)
+    ]
 
+    # --- scope-path ---
     diags: list[Diagnostic] = []
-    for path in files:
-        if any(_under_prefix(path, e) for e in config.exempt_paths):
-            continue
+    for path in nonexempt:
         if not any(_under_prefix(path, p) for p in prefixes):
             diags.append(
                 Diagnostic(
@@ -269,36 +265,22 @@ def validate_scope(
         return diags  # Scope does not even cover the files; depth is moot.
 
     # --- scope-too-broad ---
-    # Among scopes that also cover every file, reject the chosen one if a
-    # strictly more specific declared scope exists.
-    if config.require_deepest_scope:
-        deeper = sorted(
-            name
-            for name, prefs in config.scopes.items()
-            if name != scope
-            and _covers(prefs, files, config.exempt_paths)
-            and _is_deeper(prefs, prefixes, files, config.exempt_paths)
-        )
-        # Suggest only the deepest candidates (those not themselves out-deepened).
-        deepest = [
-            name
-            for name in deeper
-            if not any(
-                _is_deeper(
-                    config.scopes[other], config.scopes[name], files, config.exempt_paths
-                )
-                for other in deeper
-                if other != name
-            )
-        ]
-        if deepest:
+    # Only directory scopes are depth-checked; explicit [scopes] entries are
+    # blessed (a deliberate grouping like a merged `cpu` is never narrowed).
+    if config.require_deepest_scope and not explicit and nonexempt:
+        deepest_dir = posixpath.commonpath(nonexempt)
+        if not is_dir(deepest_dir):
+            deepest_dir = posixpath.dirname(deepest_dir)
+        chosen_dir = prefixes[0].rstrip("/")
+        if chosen_dir != deepest_dir and _under_prefix(deepest_dir, chosen_dir):
+            suggest = _strip_roots(deepest_dir, config.roots) or deepest_dir
             diags.append(
                 Diagnostic(
                     line=1,
                     rule="scope-too-broad",
                     message=(
                         f"scope '{scope}' is broader than necessary; all files "
-                        f"fit deeper scope: {', '.join(deepest)}"
+                        f"fit deeper scope '{suggest}'"
                     ),
                 )
             )
@@ -334,6 +316,7 @@ def validate(
     lines: list[str],
     config: ScopeConfig | None = None,
     files: list[str] | None = None,
+    is_dir=os.path.isdir,
 ) -> list[Diagnostic]:
     """Validate a parsed commit message. Returns a list of diagnostics."""
     if not lines:
@@ -353,7 +336,7 @@ def validate(
     if REVERT_RE.match(header):
         return _validate_revert(lines)
 
-    return _validate_conventional(lines, config, files or [])
+    return _validate_conventional(lines, config, files or [], is_dir)
 
 
 def _validate_revert(lines: list[str]) -> list[Diagnostic]:
@@ -389,6 +372,7 @@ def _validate_conventional(
     lines: list[str],
     config: ScopeConfig | None = None,
     files: list[str] | None = None,
+    is_dir=os.path.isdir,
 ) -> list[Diagnostic]:
     """Validate a conventional commit message."""
     diags: list[Diagnostic] = []
@@ -412,8 +396,8 @@ def _validate_conventional(
     commit_type = m.group("type")
     summary = m.group("summary")
 
-    # --- scope-enum / scope-path / scope-required ---
-    diags.extend(validate_scope(m.group("scope"), config, files or []))
+    # --- scope-enum / scope-path / scope-too-broad / scope-required ---
+    diags.extend(validate_scope(m.group("scope"), config, files or [], is_dir))
 
     # --- header-type ---
     if commit_type not in VALID_TYPES:
