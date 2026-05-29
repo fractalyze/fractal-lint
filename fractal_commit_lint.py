@@ -24,9 +24,21 @@ Usage:
 """
 
 import argparse
+import os
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
+
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # pragma: no cover - exercised on 3.10
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ModuleNotFoundError:  # pragma: no cover
+        tomllib = None  # type: ignore[assignment]
+
+CONFIG_FILENAME = ".fractal-commit-lint.toml"
 
 # ---------------------------------------------------------------------------
 # Diagnostics
@@ -73,6 +85,139 @@ def format_diagnostic(d: Diagnostic) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Scope configuration
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ScopeConfig:
+    """Repo-local scope policy loaded from .fractal-commit-lint.toml.
+
+    scopes maps each allowed scope to the list of path prefixes its commits
+    may touch. exempt_paths are prefixes ignored by the scope-path check
+    (cross-cutting files like WORKSPACE or vendored third_party trees).
+    require_scope makes a scope mandatory on every conventional commit.
+    """
+
+    scopes: dict[str, list[str]]
+    exempt_paths: list[str]
+    require_scope: bool
+
+
+def _as_prefix_list(value) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    return []
+
+
+def load_scope_config(start_dir: str = ".") -> ScopeConfig | None:
+    """Load scope policy from the nearest .fractal-commit-lint.toml.
+
+    Returns None when no config file is present (scope checks then stay
+    disabled, preserving the pre-config behaviour). Returns None with a
+    warning when a config exists but no TOML parser is available.
+    """
+    path = os.path.join(start_dir, CONFIG_FILENAME)
+    if not os.path.isfile(path):
+        return None
+    if tomllib is None:  # pragma: no cover - depends on interpreter
+        print(
+            f"fractal-commit-lint: {CONFIG_FILENAME} found but no TOML parser "
+            "available; install 'tomli' on Python < 3.11 to enable scope checks",
+            file=sys.stderr,
+        )
+        return None
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+
+    raw_scopes = data.get("scopes", {})
+    scopes = {name: _as_prefix_list(prefixes) for name, prefixes in raw_scopes.items()}
+    return ScopeConfig(
+        scopes=scopes,
+        exempt_paths=_as_prefix_list(data.get("exempt_paths", [])),
+        require_scope=bool(data.get("require_scope", False)),
+    )
+
+
+def staged_files() -> list[str]:
+    """Return the paths staged for the in-progress commit.
+
+    Empty when nothing is staged or git is unavailable (e.g. a CI mirror run
+    that lints a message without an index) — callers skip the path check then.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "diff", "--cached", "--name-only", "-z"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):  # pragma: no cover
+        return []
+    return [p for p in out.split("\0") if p]
+
+
+def _under_prefix(path: str, prefix: str) -> bool:
+    prefix = prefix.rstrip("/")
+    return path == prefix or path.startswith(prefix + "/")
+
+
+def validate_scope(
+    scope: str | None,
+    config: ScopeConfig | None,
+    files: list[str],
+) -> list[Diagnostic]:
+    """Validate the header scope against the repo scope policy."""
+    if config is None:
+        return []
+
+    if not scope:
+        if config.require_scope:
+            return [
+                Diagnostic(
+                    line=1,
+                    rule="scope-required",
+                    message="a scope is required; expected one of: "
+                    + ", ".join(sorted(config.scopes)),
+                )
+            ]
+        return []
+
+    if scope not in config.scopes:
+        return [
+            Diagnostic(
+                line=1,
+                rule="scope-enum",
+                message=f"unknown scope '{scope}'; expected one of: "
+                + ", ".join(sorted(config.scopes)),
+            )
+        ]
+
+    prefixes = config.scopes[scope]
+    if not files or not prefixes:
+        return []
+
+    diags: list[Diagnostic] = []
+    for path in files:
+        if any(_under_prefix(path, e) for e in config.exempt_paths):
+            continue
+        if not any(_under_prefix(path, p) for p in prefixes):
+            diags.append(
+                Diagnostic(
+                    line=1,
+                    rule="scope-path",
+                    message=(
+                        f"file '{path}' is outside scope '{scope}' "
+                        f"({', '.join(prefixes)})"
+                    ),
+                )
+            )
+    return diags
+
+
+# ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
 
@@ -97,7 +242,11 @@ def parse_commit_message(text: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def validate(lines: list[str]) -> list[Diagnostic]:
+def validate(
+    lines: list[str],
+    config: ScopeConfig | None = None,
+    files: list[str] | None = None,
+) -> list[Diagnostic]:
     """Validate a parsed commit message. Returns a list of diagnostics."""
     if not lines:
         return [Diagnostic(line=1, rule="header-format", message="commit message is empty")]
@@ -116,7 +265,7 @@ def validate(lines: list[str]) -> list[Diagnostic]:
     if REVERT_RE.match(header):
         return _validate_revert(lines)
 
-    return _validate_conventional(lines)
+    return _validate_conventional(lines, config, files or [])
 
 
 def _validate_revert(lines: list[str]) -> list[Diagnostic]:
@@ -148,7 +297,11 @@ def _validate_revert(lines: list[str]) -> list[Diagnostic]:
     return diags
 
 
-def _validate_conventional(lines: list[str]) -> list[Diagnostic]:
+def _validate_conventional(
+    lines: list[str],
+    config: ScopeConfig | None = None,
+    files: list[str] | None = None,
+) -> list[Diagnostic]:
     """Validate a conventional commit message."""
     diags: list[Diagnostic] = []
     header = lines[0]
@@ -170,6 +323,9 @@ def _validate_conventional(lines: list[str]) -> list[Diagnostic]:
 
     commit_type = m.group("type")
     summary = m.group("summary")
+
+    # --- scope-enum / scope-path / scope-required ---
+    diags.extend(validate_scope(m.group("scope"), config, files or []))
 
     # --- header-type ---
     if commit_type not in VALID_TYPES:
@@ -284,6 +440,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    config = load_scope_config()
+    files = staged_files() if config is not None else []
+
     exit_code = 0
     for filepath in args.files:
         try:
@@ -295,7 +454,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
 
         lines = parse_commit_message(text)
-        diags = validate(lines)
+        diags = validate(lines, config, files)
 
         for d in diags:
             print(format_diagnostic(d))
