@@ -22,21 +22,13 @@ from unittest import mock
 
 import fractal_commit_lint as fcl
 
-# Fake directory tree for directory-mode resolution (no real FS needed).
-DIRS = {
-    "xla", "xla/hlo", "xla/hlo/ir", "xla/hlo/evaluator",
-    "xla/backends", "xla/backends/cpu", "xla/backends/cpu/runtime",
-    "xla/service", "xla/service/cpu", "xla/stream_executor",
-}
-is_dir = lambda p: p.rstrip("/") in DIRS  # noqa: E731
-
-
+# Scope resolution is purely structural now — no filesystem, no fake dir tree.
 def rules(diags):
     return sorted(d.rule for d in diags)
 
 
 def check(msg, config=None, files=None):
-    return fcl.validate(fcl.parse_commit_message(msg), config, files, is_dir)
+    return fcl.validate(fcl.parse_commit_message(msg), config, files)
 
 
 def body(header):
@@ -51,7 +43,6 @@ CFG = fcl.ScopeConfig(
     },
     exempt_paths=["third_party"],
     require_scope=False,
-    require_deepest_scope=True,
     roots=["xla"],
 )
 
@@ -93,6 +84,7 @@ class DirectoryModeTest(unittest.TestCase):
         self.assertIn("scope-enum", rules(diags))
 
     def test_too_broad_dir(self):
+        # 'hlo' is a strict ancestor of the canonical 'hlo/evaluator' -> too broad.
         diags = check(body("feat(hlo): tweak evaluator"), CFG, ["xla/hlo/evaluator/e.cc"])
         self.assertIn("scope-too-broad", rules(diags))
         msg = next(d.message for d in diags if d.rule == "scope-too-broad")
@@ -103,9 +95,11 @@ class DirectoryModeTest(unittest.TestCase):
                       ["xla/hlo/ir/a.cc", "xla/hlo/evaluator/b.cc"])
         self.assertEqual(rules(diags), [])
 
-    def test_scope_path_violation(self):
+    def test_nonalias_mismatch(self):
+        # A directory-derived scope that disagrees with the files is scope-enum;
+        # scope-path is reserved for [scopes] alias violations (see below).
         diags = check(body("feat(hlo): x"), CFG, ["xla/service/cpu/c.cc"])
-        self.assertIn("scope-path", rules(diags))
+        self.assertIn("scope-enum", rules(diags))
 
     def test_exempt_path_ignored(self):
         diags = check(body("feat(hlo/evaluator): x"), CFG,
@@ -202,6 +196,117 @@ class ConfigLoadErrorTest(unittest.TestCase):
                 fcl, "load_scope_config", side_effect=ValueError("bad toml")
             ):
                 self.assertEqual(fcl.main([msg_path]), 1)
+
+
+# Canonical-derivation model: scope == camel_to_snake'd (and dictionary-mapped)
+# directory of the changed files. CamelCase repo with a rename + a drop.
+PRIME = fcl.ScopeConfig(
+    scopes={}, exempt_paths=[], require_scope=False, roots=["prime_ir"],
+    dictionary={"EllipticCurve": "ec", "src": ""},
+)
+
+
+def pcheck(msg, files):
+    return fcl.validate(fcl.parse_commit_message(msg), PRIME, files)
+
+
+class CamelToSnakeTest(unittest.TestCase):
+    def test_cases(self):
+        c = fcl._camel_to_snake
+        self.assertEqual(c("Field"), "field")
+        self.assertEqual(c("ModArith"), "mod_arith")
+        self.assertEqual(c("EllipticCurve"), "elliptic_curve")
+        self.assertEqual(c("TensorExt"), "tensor_ext")
+        self.assertEqual(c("IR"), "ir")
+        self.assertEqual(c("HTTPServer"), "http_server")
+        self.assertEqual(c("poly"), "poly")
+
+
+class CanonicalDeriveTest(unittest.TestCase):
+    def test_camel_snake_default_needs_no_dict(self):
+        self.assertEqual(rules(pcheck(body("feat(dialect/mod_arith): x"),
+                                      ["prime_ir/Dialect/ModArith/a.cc"])), [])
+
+    def test_dictionary_rename(self):
+        self.assertEqual(rules(pcheck(body("feat(dialect/ec): x"),
+                                      ["prime_ir/Dialect/EllipticCurve/a.cc"])), [])
+
+    def test_unrenamed_form_rejected(self):
+        # With EllipticCurve->ec in the dictionary, the auto form isn't canonical.
+        self.assertIn("scope-enum", rules(pcheck(
+            body("feat(dialect/elliptic_curve): x"),
+            ["prime_ir/Dialect/EllipticCurve/a.cc"])))
+
+    def test_caps_rejected_structurally(self):
+        # No scope-case rule: CamelCase simply can't match the lowercase canonical.
+        self.assertIn("scope-enum", rules(pcheck(
+            body("feat(Dialect/EllipticCurve): x"),
+            ["prime_ir/Dialect/EllipticCurve/a.cc"])))
+
+    def test_dropped_segment(self):
+        # src -> "" drops, so prime_ir/src/Field derives to 'field'.
+        self.assertEqual(rules(pcheck(body("feat(field): x"),
+                                      ["prime_ir/src/Field/a.cc"])), [])
+
+    def test_depth_cap_truncates(self):
+        # Deep file: canonical caps at 2 segments (dialect/ec), not the full path.
+        self.assertEqual(rules(pcheck(
+            body("feat(dialect/ec): x"),
+            ["prime_ir/Dialect/EllipticCurve/Conversions/PairingOps/p.cc"])), [])
+
+    def test_too_deep_scope_rejected(self):
+        # Author goes deeper than the cap -> mismatch (scope-enum).
+        self.assertIn("scope-enum", rules(pcheck(
+            body("feat(dialect/ec/conversions): x"),
+            ["prime_ir/Dialect/EllipticCurve/Conversions/PairingOps/p.cc"])))
+
+    def test_too_broad(self):
+        diags = pcheck(body("feat(dialect): x"),
+                       ["prime_ir/Dialect/EllipticCurve/a.cc"])
+        self.assertIn("scope-too-broad", rules(diags))
+        self.assertIn("dialect/ec", next(d.message for d in diags))
+
+    def test_depth_cap_override(self):
+        cfg = fcl.ScopeConfig(
+            scopes={}, exempt_paths=[], require_scope=False, roots=["prime_ir"],
+            dictionary={"EllipticCurve": "ec"}, max_scope_depth=3,
+        )
+        diags = fcl.validate(
+            fcl.parse_commit_message(body("feat(dialect/ec/conversions): x")),
+            cfg, ["prime_ir/Dialect/EllipticCurve/Conversions/PairingOps/p.cc"],
+        )
+        self.assertEqual(rules(diags), [])
+
+    def test_robust_without_filesystem(self):
+        # A single file under a directory that does not exist on disk (e.g. a
+        # commit that deletes it, or a bare CI checkout) still derives correctly
+        # — derivation is structural, never touches the filesystem.
+        self.assertEqual(rules(pcheck(body("feat(dialect/field): x"),
+                                      ["prime_ir/Dialect/Field/gone.cc"])), [])
+
+
+class RootsOrderTest(unittest.TestCase):
+    def test_longest_root_wins(self):
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, ".fractal-commit-lint.toml"), "w") as f:
+                f.write('roots = ["xla", "xla/backends"]\n')
+            cfg = fcl.load_scope_config(d)
+            self.assertEqual(cfg.roots, ["xla/backends", "xla"])  # sorted longest-first
+            # xla/backends/gpu/k.cc must strip the specific root, deriving 'gpu'.
+            diags = fcl.validate(fcl.parse_commit_message(body("feat(gpu): x")),
+                                 cfg, ["xla/backends/gpu/k.cc"])
+            self.assertEqual(rules(diags), [])
+
+
+class DictionaryLoadTest(unittest.TestCase):
+    def test_collision_warns_not_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, ".fractal-commit-lint.toml"), "w") as f:
+                f.write('[dictionary]\nEllipticCurve = "ec"\nEdwardsCurve = "ec"\n')
+            with mock.patch("sys.stderr"):
+                cfg = fcl.load_scope_config(d)  # must not raise
+            self.assertEqual(cfg.dictionary["EdwardsCurve"], "ec")
 
 
 if __name__ == "__main__":

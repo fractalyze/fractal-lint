@@ -47,46 +47,66 @@ line before the body, and a non-empty body (except `docs`).
 ### Scope policy (optional)
 
 By default the `<scope>` is free-form — any text passes. Drop a
-`.fractal-commit-lint.toml` at the repo root to constrain it. Scopes resolve
-two ways:
+`.fractal-commit-lint.toml` at the repo root to constrain it. A scope is valid
+iff it equals the **canonical** scope *derived from the changed files*, or it
+is a curated `[scopes]` alias. See [docs/scope-resolution.md](docs/scope-resolution.md).
 
-**Directory mode** (`roots`): a scope is any real directory under a root,
-named with the root stripped — `feat(hlo/evaluator)` → `xla/hlo/evaluator`.
-No enumeration; a typo like `sevice` resolves to no directory and is rejected.
-A directory scope must be the *deepest* directory containing every touched
-file, so a commit only under `xla/hlo/evaluator` can't be scoped `hlo`.
+**Derivation:** take the common directory of the changed files, strip a `roots`
+prefix, transform each segment, drop empties, join with `/`:
 
-**Explicit `[scopes]`** (exceptions): a curated name → prefix(es) map for what
-directory mode can't express — abbreviations (`se` → `xla/stream_executor`),
-deliberate multi-directory groupings (`cpu` → `backends/cpu` + `service/cpu`),
-and root-level concept scopes. Explicit scopes are *blessed*: they always
-satisfy the depth check, so a merged `cpu` is never asked to narrow.
+```
+prime_ir/Dialect/EllipticCurve/codegen.cc
+  strip root "prime_ir"  → Dialect/EllipticCurve
+  transform              → dialect/ec        (Dialect via camel_to_snake; EllipticCurve via dictionary)
+```
+
+Each segment is `dictionary[segment]` if mapped (a `""` value **drops** it), else
+`camel_to_snake(segment)` (`ModArith` → `mod_arith`, `EllipticCurve` →
+`elliptic_curve`, `IR` → `ir`). So the scope is always lowercase by
+construction — `feat(Dialect/Field)` matches nothing and is rejected; no
+separate case rule is needed. Most repos need no dictionary at all.
+
+The derived scope is capped at `max_scope_depth` segments (default 2), so a
+deeply nested file still yields a short scope (`dialect/ec`) rather than the
+whole path.
+
+**Explicit `[scopes]`** aliases cover what derivation can't express —
+abbreviations (`se` → `xla/stream_executor`), multi-directory groupings (`cpu` →
+`backends/cpu` + `service/cpu`), root-level concept scopes. Aliases are
+*blessed*: checked by scope-path only (their files must live under the prefixes).
 
 ```toml
-roots = ["xla"]                               # dirs whose children are valid scopes
+roots = ["prime_ir"]                          # stripped before deriving
 exempt_paths = ["WORKSPACE", "third_party"]   # cross-cutting, skipped by scope checks
 require_scope = false                          # set true to make scope mandatory
-require_deepest_scope = true                   # depth-check directory scopes (default)
+max_scope_depth = 2                            # cap derived scope to N segments (0 = unlimited)
 
-[scopes]
-cpu = ["xla/backends/cpu", "xla/service/cpu"]  # deliberate merge — blessed
-se = "xla/stream_executor"                     # abbreviation
-primitive-types = ["xla/xla_data.proto", "xla/types.h"]  # root-level concept
+[dictionary]                                   # raw segment → token; "" drops it
+EllipticCurve = "ec"
+src = ""
+# Field, ModArith, Poly … need no entry — camel_to_snake handles them
+
+[scopes]                                        # blessed aliases (groupings/abbrev)
+cpu = ["xla/backends/cpu", "xla/service/cpu"]
+se = "xla/stream_executor"
 ```
 
 Rules, active only when the config file is present:
 
 | Rule | Description |
 | --- | --- |
-| `scope-enum` | `<scope>` must resolve to a directory under `roots` or a `[scopes]` key |
-| `scope-path` | every staged file must live under the scope's directory/prefixes (or `exempt_paths`) |
-| `scope-too-broad` | a *directory* scope must be the deepest directory covering all files (explicit scopes are exempt); disable with `require_deepest_scope = false` |
+| `scope-enum` | the scope must equal the canonical scope derived from the changed files, or be a `[scopes]` alias |
+| `scope-too-broad` | the scope is a strict ancestor of the canonical scope (`hlo` when files derive to `hlo/evaluator`); use the deeper scope |
+| `scope-path` | for a `[scopes]` alias, every staged file must live under one of its prefixes (or `exempt_paths`) |
 | `scope-required` | a scope must be present (only when `require_scope = true`) |
 
 The staged set comes from `git diff --cached`; when it can't be resolved
-(a CI run linting a message with no index), `scope-path`/`scope-too-broad` are
-skipped while `scope-enum` still applies. Repos without the config file are
-unaffected.
+(a CI run linting a message with no index), a non-alias scope can't be derived
+and the check is skipped. Repos without the config file are unaffected.
+
+Dictionary values must be lowercase, and two segments mapping to the same token
+are flagged as a load-time warning (the scope would no longer name one
+component); neither fails the run.
 
 ## Suppression
 

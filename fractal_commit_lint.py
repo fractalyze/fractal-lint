@@ -94,32 +94,28 @@ def format_diagnostic(d: Diagnostic) -> str:
 class ScopeConfig:
     """Repo-local scope policy loaded from .fractal-commit-lint.toml.
 
-    Two ways a scope resolves to the paths its commits may touch:
+    A scope is valid iff it equals the *canonical* scope derived from the
+    changed files' directory, or it is a curated `[scopes]` alias. See
+    docs/scope-resolution.md.
 
-    * directory mode (roots): a scope is any real directory under one of
-      `roots`. `feat(hlo/evaluator)` -> `xla/hlo/evaluator` when roots=["xla"].
-      No enumeration; a typo like `sevice` resolves to no directory and is
-      rejected. Directory scopes are deepest-checked: a directory scope that
-      is a strict ancestor of the changed files' common directory is rejected
-      (scope-too-broad).
-    * scopes (explicit exceptions): a curated name -> path-prefix(es) map for
-      things directory mode can't express — abbreviations (`se` ->
-      `xla/stream_executor`), root-level concept scopes (`primitive-types`),
-      and deliberate multi-directory groupings (`cpu` -> backends/cpu +
-      service/cpu). An explicit scope is blessed: it always satisfies the
-      deepest check, so a merged `cpu` is never asked to narrow.
-
-    exempt_paths are prefixes ignored by scope-path and deepest (cross-cutting
-    files like WORKSPACE or vendored third_party trees). require_scope makes a
-    scope mandatory. require_deepest_scope toggles the directory-mode depth
-    check.
+    * roots: prefixes stripped from the changed-file directory before deriving
+      (roots=["xla"] turns xla/hlo/evaluator into hlo/evaluator).
+    * dictionary: per-segment overrides applied during derivation. "" drops the
+      segment (`src = ""`); any other value renames it (`EllipticCurve = "ec"`).
+      Segments with no entry are camel_to_snake'd, so most repos need none.
+    * scopes: curated name -> path-prefix(es) aliases for what derivation can't
+      express — multi-directory groupings (`cpu` -> backends/cpu + service/cpu)
+      and abbreviations. Aliases are blessed: checked by scope-path only.
+    * exempt_paths: prefixes ignored by scope checks (WORKSPACE, third_party).
+    * require_scope: make a scope mandatory.
     """
 
     scopes: dict[str, list[str]]
     exempt_paths: list[str]
     require_scope: bool
-    require_deepest_scope: bool = True
     roots: list[str] = field(default_factory=list)
+    dictionary: dict[str, str] = field(default_factory=dict)
+    max_scope_depth: int = 2  # cap derived scope to N segments (0 = unlimited)
 
 
 def _as_prefix_list(value) -> list[str]:
@@ -152,13 +148,44 @@ def load_scope_config(start_dir: str = ".") -> ScopeConfig | None:
 
     raw_scopes = data.get("scopes", {})
     scopes = {name: _as_prefix_list(prefixes) for name, prefixes in raw_scopes.items()}
+    dictionary = {str(k): str(v) for k, v in data.get("dictionary", {}).items()}
+    _warn_dictionary(dictionary)
     return ScopeConfig(
         scopes=scopes,
         exempt_paths=_as_prefix_list(data.get("exempt_paths", [])),
         require_scope=bool(data.get("require_scope", False)),
-        require_deepest_scope=bool(data.get("require_deepest_scope", True)),
-        roots=_as_prefix_list(data.get("roots", [])),
+        # Longest first so a specific root (xla/backends) strips before a
+        # shorter one (xla) that would otherwise shadow it in _strip_roots.
+        roots=sorted(_as_prefix_list(data.get("roots", [])), key=len, reverse=True),
+        dictionary=dictionary,
+        max_scope_depth=int(data.get("max_scope_depth", 2)),
     )
+
+
+def _warn_dictionary(dictionary: dict[str, str]) -> None:
+    """Config-load sanity checks for [dictionary] (warn, never fail)."""
+    for seg, token in dictionary.items():
+        if token != token.lower():
+            print(
+                f"fractal-commit-lint: dictionary value '{token}' for '{seg}' "
+                "is not lowercase; scopes must be lowercase",
+                file=sys.stderr,
+            )
+    # Two segments mapping to the same non-empty token make that scope
+    # ambiguous (it no longer names one component). Validation still works, so
+    # this is a warning, not an error.
+    seen: dict[str, str] = {}
+    for seg, token in dictionary.items():
+        if token == "":
+            continue
+        if token in seen:
+            print(
+                f"fractal-commit-lint: dictionary maps both '{seen[token]}' and "
+                f"'{seg}' to '{token}'; the scope no longer names one component",
+                file=sys.stderr,
+            )
+        else:
+            seen[token] = seg
 
 
 def staged_files() -> list[str]:
@@ -201,37 +228,55 @@ def _strip_roots(path: str, roots: list[str]) -> str:
     return path
 
 
-def resolve_scope(
-    scope: str,
-    config: ScopeConfig,
-    is_dir,
-) -> tuple[list[str] | None, bool]:
-    """Resolve a scope to its path prefixes.
+_CAMEL_BOUNDARY_1 = re.compile(r"(.)([A-Z][a-z]+)")
+_CAMEL_BOUNDARY_2 = re.compile(r"([a-z0-9])([A-Z])")
 
-    Returns (prefixes, explicit). explicit=True means the scope came from the
-    curated [scopes] map (blessed: exempt from the deepest check). A None
-    prefixes means the scope resolved to nothing (unknown scope).
+
+def _camel_to_snake(segment: str) -> str:
+    """CamelCase -> snake_case, lowercased — word-split and lowercase in one.
+
+    Field -> field, ModArith -> mod_arith, EllipticCurve -> elliptic_curve,
+    IR -> ir, HTTPServer -> http_server. Already-snake names stay put. This is
+    why most repos need no [dictionary] entries.
     """
-    if scope in config.scopes:
-        return config.scopes[scope], True
-    for r in config.roots:
-        cand = r.rstrip("/") + "/" + scope
-        if is_dir(cand):
-            return [cand], False
-    if is_dir(scope):
-        return [scope], False
-    return None, False
+    s = _CAMEL_BOUNDARY_1.sub(r"\1_\2", segment)
+    s = _CAMEL_BOUNDARY_2.sub(r"\1_\2", s)
+    return s.replace("-", "_").lower()
+
+
+def _transform_segment(segment: str, config: ScopeConfig) -> str:
+    """A [dictionary] override wins ("" drops the segment); else camel_to_snake."""
+    if segment in config.dictionary:
+        return config.dictionary[segment]
+    return _camel_to_snake(segment)
+
+
+def _derive_scope(directory: str, config: ScopeConfig) -> str:
+    """Canonical scope for a directory: strip a root, transform each segment,
+    drop empties, join. Empty when the dir is a bare root or all segments drop.
+    """
+    stripped = _strip_roots(directory, config.roots)
+    if not stripped:
+        return ""
+    segs = [t for s in stripped.split("/") if (t := _transform_segment(s, config))]
+    if config.max_scope_depth > 0:
+        segs = segs[: config.max_scope_depth]
+    return "/".join(segs)
 
 
 def validate_scope(
     scope: str | None,
     config: ScopeConfig | None,
     files: list[str],
-    is_dir=os.path.isdir,
 ) -> list[Diagnostic]:
-    """Validate the header scope against the repo scope policy."""
+    """Validate the header scope: it must equal the canonical scope derived
+    from the changed files, or be a curated [scopes] alias."""
     if config is None:
         return []
+
+    nonexempt = [
+        f for f in files if not any(_under_prefix(f, e) for e in config.exempt_paths)
+    ]
 
     if not scope:
         if config.require_scope:
@@ -240,56 +285,56 @@ def validate_scope(
             ]
         return []
 
-    prefixes, explicit = resolve_scope(scope, config, is_dir)
-    if prefixes is None:
-        hint = "a directory under " + ", ".join(config.roots) if config.roots else None
-        choices = ", ".join(sorted(config.scopes))
-        msg = f"unknown scope '{scope}'; expected "
-        msg += " or ".join(filter(None, [hint, f"one of: {choices}" if choices else ""]))
-        return [Diagnostic(line=1, rule="scope-enum", message=msg)]
-
-    nonexempt = [
-        f for f in files if not any(_under_prefix(f, e) for e in config.exempt_paths)
-    ]
-
-    # --- scope-path ---
-    diags: list[Diagnostic] = []
-    for path in nonexempt:
-        if not any(_under_prefix(path, p) for p in prefixes):
-            diags.append(
-                Diagnostic(
-                    line=1,
-                    rule="scope-path",
-                    message=(
-                        f"file '{path}' is outside scope '{scope}' "
-                        f"({', '.join(prefixes)})"
-                    ),
-                )
+    # Curated alias (groupings / abbreviations): blessed — checked by scope-path
+    # only (every changed file must live under one of the alias' prefixes).
+    if scope in config.scopes:
+        prefixes = config.scopes[scope]
+        return [
+            Diagnostic(
+                line=1,
+                rule="scope-path",
+                message=(
+                    f"file '{p}' is outside scope '{scope}' "
+                    f"({', '.join(prefixes)})"
+                ),
             )
-    if diags:
-        return diags  # Scope does not even cover the files; depth is moot.
+            for p in nonexempt
+            if not any(_under_prefix(p, pre) for pre in prefixes)
+        ]
 
-    # --- scope-too-broad ---
-    # Only directory scopes are depth-checked; explicit [scopes] entries are
-    # blessed (a deliberate grouping like a merged `cpu` is never narrowed).
-    if config.require_deepest_scope and not explicit and nonexempt:
-        deepest_dir = posixpath.commonpath(nonexempt)
-        if not is_dir(deepest_dir):
-            deepest_dir = posixpath.dirname(deepest_dir)
-        chosen_dir = prefixes[0].rstrip("/")
-        if chosen_dir != deepest_dir and _under_prefix(deepest_dir, chosen_dir):
-            suggest = _strip_roots(deepest_dir, config.roots) or deepest_dir
-            diags.append(
-                Diagnostic(
-                    line=1,
-                    rule="scope-too-broad",
-                    message=(
-                        f"scope '{scope}' is broader than necessary; all files "
-                        f"fit deeper scope '{suggest}'"
-                    ),
-                )
+    # No files to derive from (e.g. a CI mirror linting a message with no index):
+    # a non-alias scope can't be verified — skip, as scope-path does.
+    if not nonexempt:
+        return []
+
+    common = posixpath.commonpath(nonexempt)
+    # commonpath returns one of the inputs only for a single file; otherwise it
+    # is their common directory. Purely structural (no filesystem access), so it
+    # is correct even when a commit deletes a directory or runs in a bare CI tree.
+    if common in nonexempt:
+        common = posixpath.dirname(common)
+    canonical = _derive_scope(common, config)
+
+    if scope == canonical:
+        return []
+
+    # Too broad: the scope is a strict ancestor of the canonical (deepest) scope
+    # — a distinct, friendlier diagnostic than a generic mismatch.
+    if canonical and canonical.startswith(scope + "/"):
+        return [
+            Diagnostic(
+                line=1,
+                rule="scope-too-broad",
+                message=f"scope '{scope}' is broader than necessary; use '{canonical}'",
             )
-    return diags
+        ]
+
+    aliases = ", ".join(sorted(config.scopes))
+    expected = canonical or "(none — changes are above any root)"
+    msg = f"scope '{scope}' does not match the changed files; expected '{expected}'"
+    if aliases:
+        msg += f" or a [scopes] alias ({aliases})"
+    return [Diagnostic(line=1, rule="scope-enum", message=msg)]
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +366,6 @@ def validate(
     lines: list[str],
     config: ScopeConfig | None = None,
     files: list[str] | None = None,
-    is_dir=os.path.isdir,
 ) -> list[Diagnostic]:
     """Validate a parsed commit message. Returns a list of diagnostics."""
     if not lines:
@@ -341,7 +385,7 @@ def validate(
     if REVERT_RE.match(header):
         return _validate_revert(lines)
 
-    return _validate_conventional(lines, config, files or [], is_dir)
+    return _validate_conventional(lines, config, files or [])
 
 
 def _validate_revert(lines: list[str]) -> list[Diagnostic]:
@@ -377,7 +421,6 @@ def _validate_conventional(
     lines: list[str],
     config: ScopeConfig | None = None,
     files: list[str] | None = None,
-    is_dir=os.path.isdir,
 ) -> list[Diagnostic]:
     """Validate a conventional commit message."""
     diags: list[Diagnostic] = []
@@ -402,7 +445,7 @@ def _validate_conventional(
     summary = m.group("summary")
 
     # --- scope-enum / scope-path / scope-too-broad / scope-required ---
-    diags.extend(validate_scope(m.group("scope"), config, files or [], is_dir))
+    diags.extend(validate_scope(m.group("scope"), config, files or []))
 
     # --- header-type ---
     if commit_type not in VALID_TYPES:
