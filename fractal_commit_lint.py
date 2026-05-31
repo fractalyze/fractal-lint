@@ -115,6 +115,7 @@ class ScopeConfig:
     require_scope: bool
     roots: list[str] = field(default_factory=list)
     dictionary: dict[str, str] = field(default_factory=dict)
+    max_scope_depth: int = 2  # cap derived scope to N segments (0 = unlimited)
 
 
 def _as_prefix_list(value) -> list[str]:
@@ -155,6 +156,7 @@ def load_scope_config(start_dir: str = ".") -> ScopeConfig | None:
         require_scope=bool(data.get("require_scope", False)),
         roots=_as_prefix_list(data.get("roots", [])),
         dictionary=dictionary,
+        max_scope_depth=int(data.get("max_scope_depth", 2)),
     )
 
 
@@ -254,8 +256,10 @@ def _derive_scope(directory: str, config: ScopeConfig) -> str:
     stripped = _strip_roots(directory, config.roots)
     if not stripped:
         return ""
-    segs = [_transform_segment(s, config) for s in stripped.split("/")]
-    return "/".join(s for s in segs if s)
+    segs = [t for s in stripped.split("/") if (t := _transform_segment(s, config))]
+    if config.max_scope_depth > 0:
+        segs = segs[: config.max_scope_depth]
+    return "/".join(segs)
 
 
 def validate_scope(
@@ -309,6 +313,17 @@ def validate_scope(
 
     if scope == canonical:
         return []
+
+    # Too broad: the scope is a strict ancestor of the canonical (deepest) scope
+    # — a distinct, friendlier diagnostic than a generic mismatch.
+    if canonical and canonical.startswith(scope + "/"):
+        return [
+            Diagnostic(
+                line=1,
+                rule="scope-too-broad",
+                message=f"scope '{scope}' is broader than necessary; use '{canonical}'",
+            )
+        ]
 
     aliases = ", ".join(sorted(config.scopes))
     expected = canonical or "(none — changes are above any root)"

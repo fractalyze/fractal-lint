@@ -66,6 +66,10 @@ Each segment is `dictionary[segment]` if mapped (a `""` value **drops** it), els
 construction — `feat(Dialect/Field)` matches nothing and is rejected; no
 separate case rule is needed. Most repos need no dictionary at all.
 
+The derived scope is capped at `max_scope_depth` segments (default 2), so a
+deeply nested file still yields a short scope (`dialect/ec`) rather than the
+whole path.
+
 **Explicit `[scopes]`** aliases cover what derivation can't express —
 abbreviations (`se` → `xla/stream_executor`), multi-directory groupings (`cpu` →
 `backends/cpu` + `service/cpu`), root-level concept scopes. Aliases are
@@ -75,6 +79,7 @@ abbreviations (`se` → `xla/stream_executor`), multi-directory groupings (`cpu`
 roots = ["prime_ir"]                          # stripped before deriving
 exempt_paths = ["WORKSPACE", "third_party"]   # cross-cutting, skipped by scope checks
 require_scope = false                          # set true to make scope mandatory
+max_scope_depth = 2                            # cap derived scope to N segments (0 = unlimited)
 
 [dictionary]                                   # raw segment → token; "" drops it
 EllipticCurve = "ec"
@@ -91,6 +96,7 @@ Rules, active only when the config file is present:
 | Rule | Description |
 | --- | --- |
 | `scope-enum` | the scope must equal the canonical scope derived from the changed files, or be a `[scopes]` alias |
+| `scope-too-broad` | the scope is a strict ancestor of the canonical scope (`hlo` when files derive to `hlo/evaluator`); use the deeper scope |
 | `scope-path` | for a `[scopes]` alias, every staged file must live under one of its prefixes (or `exempt_paths`) |
 | `scope-required` | a scope must be present (only when `require_scope = true`) |
 

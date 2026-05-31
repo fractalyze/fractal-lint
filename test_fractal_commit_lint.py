@@ -92,11 +92,10 @@ class DirectoryModeTest(unittest.TestCase):
         self.assertIn("scope-enum", rules(diags))
 
     def test_too_broad_dir(self):
-        # 'hlo' no longer matches when files sit deeper; the canonical scope is
-        # the deepest common dir, so this is a plain mismatch naming it.
+        # 'hlo' is a strict ancestor of the canonical 'hlo/evaluator' -> too broad.
         diags = check(body("feat(hlo): tweak evaluator"), CFG, ["xla/hlo/evaluator/e.cc"])
-        self.assertIn("scope-enum", rules(diags))
-        msg = next(d.message for d in diags if d.rule == "scope-enum")
+        self.assertIn("scope-too-broad", rules(diags))
+        msg = next(d.message for d in diags if d.rule == "scope-too-broad")
         self.assertIn("hlo/evaluator", msg)
 
     def test_span_siblings_uses_parent(self):
@@ -211,6 +210,8 @@ class ConfigLoadErrorTest(unittest.TestCase):
 # directory of the changed files. CamelCase repo with a rename + a drop.
 PRIME_DIRS = {
     "prime_ir", "prime_ir/Dialect", "prime_ir/Dialect/EllipticCurve",
+    "prime_ir/Dialect/EllipticCurve/Conversions",
+    "prime_ir/Dialect/EllipticCurve/Conversions/PairingOps",
     "prime_ir/Dialect/ModArith", "prime_ir/Dialect/Field",
     "prime_ir/src", "prime_ir/src/Field",
 }
@@ -263,6 +264,36 @@ class CanonicalDeriveTest(unittest.TestCase):
         # src -> "" drops, so prime_ir/src/Field derives to 'field'.
         self.assertEqual(rules(pcheck(body("feat(field): x"),
                                       ["prime_ir/src/Field/a.cc"])), [])
+
+    def test_depth_cap_truncates(self):
+        # Deep file: canonical caps at 2 segments (dialect/ec), not the full path.
+        self.assertEqual(rules(pcheck(
+            body("feat(dialect/ec): x"),
+            ["prime_ir/Dialect/EllipticCurve/Conversions/PairingOps/p.cc"])), [])
+
+    def test_too_deep_scope_rejected(self):
+        # Author goes deeper than the cap -> mismatch (scope-enum).
+        self.assertIn("scope-enum", rules(pcheck(
+            body("feat(dialect/ec/conversions): x"),
+            ["prime_ir/Dialect/EllipticCurve/Conversions/PairingOps/p.cc"])))
+
+    def test_too_broad(self):
+        diags = pcheck(body("feat(dialect): x"),
+                       ["prime_ir/Dialect/EllipticCurve/a.cc"])
+        self.assertIn("scope-too-broad", rules(diags))
+        self.assertIn("dialect/ec", next(d.message for d in diags))
+
+    def test_depth_cap_override(self):
+        cfg = fcl.ScopeConfig(
+            scopes={}, exempt_paths=[], require_scope=False, roots=["prime_ir"],
+            dictionary={"EllipticCurve": "ec"}, max_scope_depth=3,
+        )
+        diags = fcl.validate(
+            fcl.parse_commit_message(body("feat(dialect/ec/conversions): x")),
+            cfg, ["prime_ir/Dialect/EllipticCurve/Conversions/PairingOps/p.cc"],
+            prime_is_dir,
+        )
+        self.assertEqual(rules(diags), [])
 
 
 class DictionaryLoadTest(unittest.TestCase):

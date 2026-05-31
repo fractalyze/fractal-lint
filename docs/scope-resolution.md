@@ -90,8 +90,12 @@ else:                             derive canonical from commonpath(files)
 if no files (e.g. CI title-only): non-alias scopes can't be verified -> skipped
 ```
 
-The deepest-directory behaviour falls out for free: the canonical scope *is* the
-deepest common directory, so a too-broad scope simply won't match.
+The canonical scope is capped at `max_scope_depth` segments (default 2) so deep
+trees still yield short scopes (`dialect/ec`, not the whole path). The
+deepest-directory behaviour falls out for free: the canonical scope *is* the
+(capped) deepest common directory. A scope that is a strict *ancestor* of it is
+reported as `scope-too-broad` (naming the deeper scope to use); any other
+mismatch is `scope-enum`.
 
 ## Migration
 
