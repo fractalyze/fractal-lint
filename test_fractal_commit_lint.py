@@ -51,7 +51,6 @@ CFG = fcl.ScopeConfig(
     },
     exempt_paths=["third_party"],
     require_scope=False,
-    require_deepest_scope=True,
     roots=["xla"],
 )
 
@@ -93,9 +92,11 @@ class DirectoryModeTest(unittest.TestCase):
         self.assertIn("scope-enum", rules(diags))
 
     def test_too_broad_dir(self):
+        # 'hlo' no longer matches when files sit deeper; the canonical scope is
+        # the deepest common dir, so this is a plain mismatch naming it.
         diags = check(body("feat(hlo): tweak evaluator"), CFG, ["xla/hlo/evaluator/e.cc"])
-        self.assertIn("scope-too-broad", rules(diags))
-        msg = next(d.message for d in diags if d.rule == "scope-too-broad")
+        self.assertIn("scope-enum", rules(diags))
+        msg = next(d.message for d in diags if d.rule == "scope-enum")
         self.assertIn("hlo/evaluator", msg)
 
     def test_span_siblings_uses_parent(self):
@@ -103,9 +104,11 @@ class DirectoryModeTest(unittest.TestCase):
                       ["xla/hlo/ir/a.cc", "xla/hlo/evaluator/b.cc"])
         self.assertEqual(rules(diags), [])
 
-    def test_scope_path_violation(self):
+    def test_nonalias_mismatch(self):
+        # A directory-derived scope that disagrees with the files is scope-enum;
+        # scope-path is reserved for [scopes] alias violations (see below).
         diags = check(body("feat(hlo): x"), CFG, ["xla/service/cpu/c.cc"])
-        self.assertIn("scope-path", rules(diags))
+        self.assertIn("scope-enum", rules(diags))
 
     def test_exempt_path_ignored(self):
         diags = check(body("feat(hlo/evaluator): x"), CFG,
@@ -202,6 +205,74 @@ class ConfigLoadErrorTest(unittest.TestCase):
                 fcl, "load_scope_config", side_effect=ValueError("bad toml")
             ):
                 self.assertEqual(fcl.main([msg_path]), 1)
+
+
+# Canonical-derivation model: scope == camel_to_snake'd (and dictionary-mapped)
+# directory of the changed files. CamelCase repo with a rename + a drop.
+PRIME_DIRS = {
+    "prime_ir", "prime_ir/Dialect", "prime_ir/Dialect/EllipticCurve",
+    "prime_ir/Dialect/ModArith", "prime_ir/Dialect/Field",
+    "prime_ir/src", "prime_ir/src/Field",
+}
+prime_is_dir = lambda p: p.rstrip("/") in PRIME_DIRS  # noqa: E731
+
+PRIME = fcl.ScopeConfig(
+    scopes={}, exempt_paths=[], require_scope=False, roots=["prime_ir"],
+    dictionary={"EllipticCurve": "ec", "src": ""},
+)
+
+
+def pcheck(msg, files):
+    return fcl.validate(fcl.parse_commit_message(msg), PRIME, files, prime_is_dir)
+
+
+class CamelToSnakeTest(unittest.TestCase):
+    def test_cases(self):
+        c = fcl._camel_to_snake
+        self.assertEqual(c("Field"), "field")
+        self.assertEqual(c("ModArith"), "mod_arith")
+        self.assertEqual(c("EllipticCurve"), "elliptic_curve")
+        self.assertEqual(c("TensorExt"), "tensor_ext")
+        self.assertEqual(c("IR"), "ir")
+        self.assertEqual(c("HTTPServer"), "http_server")
+        self.assertEqual(c("poly"), "poly")
+
+
+class CanonicalDeriveTest(unittest.TestCase):
+    def test_camel_snake_default_needs_no_dict(self):
+        self.assertEqual(rules(pcheck(body("feat(dialect/mod_arith): x"),
+                                      ["prime_ir/Dialect/ModArith/a.cc"])), [])
+
+    def test_dictionary_rename(self):
+        self.assertEqual(rules(pcheck(body("feat(dialect/ec): x"),
+                                      ["prime_ir/Dialect/EllipticCurve/a.cc"])), [])
+
+    def test_unrenamed_form_rejected(self):
+        # With EllipticCurve->ec in the dictionary, the auto form isn't canonical.
+        self.assertIn("scope-enum", rules(pcheck(
+            body("feat(dialect/elliptic_curve): x"),
+            ["prime_ir/Dialect/EllipticCurve/a.cc"])))
+
+    def test_caps_rejected_structurally(self):
+        # No scope-case rule: CamelCase simply can't match the lowercase canonical.
+        self.assertIn("scope-enum", rules(pcheck(
+            body("feat(Dialect/EllipticCurve): x"),
+            ["prime_ir/Dialect/EllipticCurve/a.cc"])))
+
+    def test_dropped_segment(self):
+        # src -> "" drops, so prime_ir/src/Field derives to 'field'.
+        self.assertEqual(rules(pcheck(body("feat(field): x"),
+                                      ["prime_ir/src/Field/a.cc"])), [])
+
+
+class DictionaryLoadTest(unittest.TestCase):
+    def test_collision_warns_not_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, ".fractal-commit-lint.toml"), "w") as f:
+                f.write('[dictionary]\nEllipticCurve = "ec"\nEdwardsCurve = "ec"\n')
+            with mock.patch("sys.stderr"):
+                cfg = fcl.load_scope_config(d)  # must not raise
+            self.assertEqual(cfg.dictionary["EdwardsCurve"], "ec")
 
 
 if __name__ == "__main__":
