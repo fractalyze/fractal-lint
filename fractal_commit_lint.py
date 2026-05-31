@@ -174,13 +174,18 @@ def staged_files() -> list[str]:
             text=True,
             check=True,
         ).stdout
-    except (OSError, subprocess.CalledProcessError):  # pragma: no cover
+    except Exception:  # pragma: no cover
+        # text=True can raise UnicodeDecodeError (a ValueError, not OSError) on
+        # non-UTF-8 filenames; fail soft so the linter never blocks a commit.
         return []
     return [p for p in out.split("\0") if p]
 
 
 def _under_prefix(path: str, prefix: str) -> bool:
     prefix = prefix.rstrip("/")
+    # An empty / "." / "/" prefix is the repository root and matches any path.
+    if prefix in ("", "."):
+        return True
     return path == prefix or path.startswith(prefix + "/")
 
 
@@ -512,7 +517,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    config = load_scope_config()
+    try:
+        config = load_scope_config()
+    except Exception as e:  # malformed .fractal-commit-lint.toml, etc.
+        print(f"fractal-commit-lint: error loading config: {e}", file=sys.stderr)
+        return 1
     files = staged_files() if config is not None else []
 
     exit_code = 0

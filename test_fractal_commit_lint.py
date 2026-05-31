@@ -15,7 +15,10 @@
 
 """Tests for fractal_commit_lint."""
 
+import os
+import tempfile
 import unittest
+from unittest import mock
 
 import fractal_commit_lint as fcl
 
@@ -161,6 +164,44 @@ class MergeRevertTest(unittest.TestCase):
     def test_revert_skipped(self):
         msg = "revert: feat(zk): x\n\nThis reverts commit abc123."
         self.assertEqual(rules(check(msg, CFG, ["whatever/x"])), [])
+
+
+class RootPrefixTest(unittest.TestCase):
+    def test_root_prefix_matches_any_path(self):
+        for root in ("", ".", "/"):
+            self.assertTrue(fcl._under_prefix("xla/hlo/x.cc", root))
+
+    def test_normal_prefix_still_scoped(self):
+        self.assertTrue(fcl._under_prefix("xla/hlo/x.cc", "xla/hlo"))
+        self.assertFalse(fcl._under_prefix("xla/service/x.cc", "xla/hlo"))
+
+
+class StagedFilesTest(unittest.TestCase):
+    def test_unicode_decode_error_fails_soft(self):
+        # text=True can raise UnicodeDecodeError (a ValueError, not OSError) on
+        # non-UTF-8 filenames; staged_files must not crash the linter.
+        err = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        with mock.patch("subprocess.run", side_effect=err):
+            self.assertEqual(fcl.staged_files(), [])
+
+
+class ConfigLoadErrorTest(unittest.TestCase):
+    def test_malformed_toml_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, ".fractal-commit-lint.toml"), "w") as f:
+                f.write("not valid toml [[[\n")
+            with self.assertRaises(Exception):
+                fcl.load_scope_config(d)
+
+    def test_main_reports_malformed_config(self):
+        with tempfile.TemporaryDirectory() as d:
+            msg_path = os.path.join(d, "COMMIT_EDITMSG")
+            with open(msg_path, "w") as f:
+                f.write("feat: x\n\nA body that is long enough to pass.")
+            with mock.patch.object(
+                fcl, "load_scope_config", side_effect=ValueError("bad toml")
+            ):
+                self.assertEqual(fcl.main([msg_path]), 1)
 
 
 if __name__ == "__main__":
