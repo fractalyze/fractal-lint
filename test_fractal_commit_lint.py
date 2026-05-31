@@ -22,21 +22,13 @@ from unittest import mock
 
 import fractal_commit_lint as fcl
 
-# Fake directory tree for directory-mode resolution (no real FS needed).
-DIRS = {
-    "xla", "xla/hlo", "xla/hlo/ir", "xla/hlo/evaluator",
-    "xla/backends", "xla/backends/cpu", "xla/backends/cpu/runtime",
-    "xla/service", "xla/service/cpu", "xla/stream_executor",
-}
-is_dir = lambda p: p.rstrip("/") in DIRS  # noqa: E731
-
-
+# Scope resolution is purely structural now — no filesystem, no fake dir tree.
 def rules(diags):
     return sorted(d.rule for d in diags)
 
 
 def check(msg, config=None, files=None):
-    return fcl.validate(fcl.parse_commit_message(msg), config, files, is_dir)
+    return fcl.validate(fcl.parse_commit_message(msg), config, files)
 
 
 def body(header):
@@ -208,15 +200,6 @@ class ConfigLoadErrorTest(unittest.TestCase):
 
 # Canonical-derivation model: scope == camel_to_snake'd (and dictionary-mapped)
 # directory of the changed files. CamelCase repo with a rename + a drop.
-PRIME_DIRS = {
-    "prime_ir", "prime_ir/Dialect", "prime_ir/Dialect/EllipticCurve",
-    "prime_ir/Dialect/EllipticCurve/Conversions",
-    "prime_ir/Dialect/EllipticCurve/Conversions/PairingOps",
-    "prime_ir/Dialect/ModArith", "prime_ir/Dialect/Field",
-    "prime_ir/src", "prime_ir/src/Field",
-}
-prime_is_dir = lambda p: p.rstrip("/") in PRIME_DIRS  # noqa: E731
-
 PRIME = fcl.ScopeConfig(
     scopes={}, exempt_paths=[], require_scope=False, roots=["prime_ir"],
     dictionary={"EllipticCurve": "ec", "src": ""},
@@ -224,7 +207,7 @@ PRIME = fcl.ScopeConfig(
 
 
 def pcheck(msg, files):
-    return fcl.validate(fcl.parse_commit_message(msg), PRIME, files, prime_is_dir)
+    return fcl.validate(fcl.parse_commit_message(msg), PRIME, files)
 
 
 class CamelToSnakeTest(unittest.TestCase):
@@ -291,9 +274,29 @@ class CanonicalDeriveTest(unittest.TestCase):
         diags = fcl.validate(
             fcl.parse_commit_message(body("feat(dialect/ec/conversions): x")),
             cfg, ["prime_ir/Dialect/EllipticCurve/Conversions/PairingOps/p.cc"],
-            prime_is_dir,
         )
         self.assertEqual(rules(diags), [])
+
+    def test_robust_without_filesystem(self):
+        # A single file under a directory that does not exist on disk (e.g. a
+        # commit that deletes it, or a bare CI checkout) still derives correctly
+        # — derivation is structural, never touches the filesystem.
+        self.assertEqual(rules(pcheck(body("feat(dialect/field): x"),
+                                      ["prime_ir/Dialect/Field/gone.cc"])), [])
+
+
+class RootsOrderTest(unittest.TestCase):
+    def test_longest_root_wins(self):
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, ".fractal-commit-lint.toml"), "w") as f:
+                f.write('roots = ["xla", "xla/backends"]\n')
+            cfg = fcl.load_scope_config(d)
+            self.assertEqual(cfg.roots, ["xla/backends", "xla"])  # sorted longest-first
+            # xla/backends/gpu/k.cc must strip the specific root, deriving 'gpu'.
+            diags = fcl.validate(fcl.parse_commit_message(body("feat(gpu): x")),
+                                 cfg, ["xla/backends/gpu/k.cc"])
+            self.assertEqual(rules(diags), [])
 
 
 class DictionaryLoadTest(unittest.TestCase):

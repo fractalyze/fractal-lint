@@ -154,7 +154,9 @@ def load_scope_config(start_dir: str = ".") -> ScopeConfig | None:
         scopes=scopes,
         exempt_paths=_as_prefix_list(data.get("exempt_paths", [])),
         require_scope=bool(data.get("require_scope", False)),
-        roots=_as_prefix_list(data.get("roots", [])),
+        # Longest first so a specific root (xla/backends) strips before a
+        # shorter one (xla) that would otherwise shadow it in _strip_roots.
+        roots=sorted(_as_prefix_list(data.get("roots", [])), key=len, reverse=True),
         dictionary=dictionary,
         max_scope_depth=int(data.get("max_scope_depth", 2)),
     )
@@ -266,7 +268,6 @@ def validate_scope(
     scope: str | None,
     config: ScopeConfig | None,
     files: list[str],
-    is_dir=os.path.isdir,
 ) -> list[Diagnostic]:
     """Validate the header scope: it must equal the canonical scope derived
     from the changed files, or be a curated [scopes] alias."""
@@ -307,7 +308,10 @@ def validate_scope(
         return []
 
     common = posixpath.commonpath(nonexempt)
-    if not is_dir(common):
+    # commonpath returns one of the inputs only for a single file; otherwise it
+    # is their common directory. Purely structural (no filesystem access), so it
+    # is correct even when a commit deletes a directory or runs in a bare CI tree.
+    if common in nonexempt:
         common = posixpath.dirname(common)
     canonical = _derive_scope(common, config)
 
@@ -362,7 +366,6 @@ def validate(
     lines: list[str],
     config: ScopeConfig | None = None,
     files: list[str] | None = None,
-    is_dir=os.path.isdir,
 ) -> list[Diagnostic]:
     """Validate a parsed commit message. Returns a list of diagnostics."""
     if not lines:
@@ -382,7 +385,7 @@ def validate(
     if REVERT_RE.match(header):
         return _validate_revert(lines)
 
-    return _validate_conventional(lines, config, files or [], is_dir)
+    return _validate_conventional(lines, config, files or [])
 
 
 def _validate_revert(lines: list[str]) -> list[Diagnostic]:
@@ -418,7 +421,6 @@ def _validate_conventional(
     lines: list[str],
     config: ScopeConfig | None = None,
     files: list[str] | None = None,
-    is_dir=os.path.isdir,
 ) -> list[Diagnostic]:
     """Validate a conventional commit message."""
     diags: list[Diagnostic] = []
@@ -443,7 +445,7 @@ def _validate_conventional(
     summary = m.group("summary")
 
     # --- scope-enum / scope-path / scope-too-broad / scope-required ---
-    diags.extend(validate_scope(m.group("scope"), config, files or [], is_dir))
+    diags.extend(validate_scope(m.group("scope"), config, files or []))
 
     # --- header-type ---
     if commit_type not in VALID_TYPES:
