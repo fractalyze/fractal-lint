@@ -14,11 +14,17 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Fractal build lint — BUILD.bazel linter for ZKX.
+"""Fractal build lint — BUILD.bazel linter.
 
 Enforces:
   - build-target-sort: library targets must be alphabetically sorted by name.
-  - build-test-name: test targets must be named {dirname}_unittests.
+  - build-test-name: test targets must be named after the test-name template.
+
+Which rule names count as "library"/"test" targets, the test-name template, and
+which rules run are configurable per repo via a `.fractal-build-lint.toml` at
+the repo root, so each repo can point the linter at its own Bazel macros (e.g.
+prime_ir_cc_library / prime_ir_cc_test). With no config file the defaults below
+preserve the original behavior. See docs/build-lint-config.md.
 
 Usage:
     fractal-build-lint [--fix] [--rules=rule1,rule2] BUILD.bazel ...
@@ -28,7 +34,17 @@ import argparse
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # pragma: no cover - exercised on 3.10
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ModuleNotFoundError:  # pragma: no cover
+        tomllib = None  # type: ignore[assignment]
+
+CONFIG_FILENAME = ".fractal-build-lint.toml"
 
 
 # ---------------------------------------------------------------------------
@@ -49,14 +65,99 @@ def format_diagnostic(d: Diagnostic) -> str:
 
 
 # ---------------------------------------------------------------------------
-# BUILD file parsing
+# Configuration
 # ---------------------------------------------------------------------------
 
-# Library rules whose targets should be sorted alphabetically.
-LIBRARY_RULES = frozenset({"cc_library", "zkx_cc_library"})
+ALL_RULES = ["build-target-sort", "build-test-name"]
 
-# Test rules whose naming convention should be checked.
-TEST_RULES = frozenset({"cc_test", "zkx_cc_unittest"})
+# Defaults preserve the pre-config behavior when no .fractal-build-lint.toml is
+# present. Repos point these at their own macros via the config file.
+DEFAULT_LIBRARY_RULES = frozenset({"cc_library", "zkx_cc_library"})
+DEFAULT_TEST_RULES = frozenset({"cc_test", "zkx_cc_unittest"})
+DEFAULT_TEST_NAME_TEMPLATE = "{dirname}_unittests"
+
+
+@dataclass
+class BuildConfig:
+    """Repo-local build-lint policy from .fractal-build-lint.toml.
+
+    * library_rules: rule names whose targets build-target-sort orders.
+    * test_rules: rule names whose names build-test-name checks.
+    * test_name_template: expected test name, with a `{dirname}` placeholder.
+    * rules: enabled rule subset (None = all). Lets a repo whose test naming
+      doesn't fit the template run only build-target-sort.
+    """
+
+    library_rules: frozenset = DEFAULT_LIBRARY_RULES
+    test_rules: frozenset = DEFAULT_TEST_RULES
+    test_name_template: str = DEFAULT_TEST_NAME_TEMPLATE
+    rules: list = field(default_factory=lambda: list(ALL_RULES))
+
+
+def load_build_config(start_dir: str = ".") -> BuildConfig:
+    """Load build-lint policy from the nearest .fractal-build-lint.toml.
+
+    Returns defaults when no config file is present (preserving pre-config
+    behavior), or when a config exists but no TOML parser is available.
+    """
+    path = os.path.join(start_dir, CONFIG_FILENAME)
+    if not os.path.isfile(path):
+        return BuildConfig()
+    if tomllib is None:  # pragma: no cover - depends on interpreter
+        print(
+            f"fractal-build-lint: {CONFIG_FILENAME} found but no TOML parser "
+            "available; install 'tomli' on Python < 3.11 to enable config",
+            file=sys.stderr,
+        )
+        return BuildConfig()
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+
+    def _list_of_str(key: str) -> list[str]:
+        # Reject a bare string/non-list: iterating a str would silently yield
+        # one "rule" per character instead of a clear config error.
+        value = data[key]
+        if not isinstance(value, list):
+            raise ValueError(f"{CONFIG_FILENAME}: '{key}' must be a list of strings")
+        return [str(v) for v in value]
+
+    def _ruleset(key: str, default: frozenset) -> frozenset:
+        if key not in data:
+            return default
+        return frozenset(_list_of_str(key))
+
+    if "rules" in data:
+        rules = _list_of_str("rules")
+        unknown = set(rules) - set(ALL_RULES)
+        if unknown:
+            raise ValueError(
+                f"{CONFIG_FILENAME}: unknown rules {sorted(unknown)}; "
+                f"available: {ALL_RULES}"
+            )
+    else:
+        rules = list(ALL_RULES)
+
+    template = data.get("test_name_template", DEFAULT_TEST_NAME_TEMPLATE)
+    if not isinstance(template, str):
+        raise ValueError(f"{CONFIG_FILENAME}: 'test_name_template' must be a string")
+    try:
+        template.format(dirname="x")  # validate placeholders up front
+    except (KeyError, IndexError, ValueError) as e:
+        raise ValueError(
+            f"{CONFIG_FILENAME}: invalid 'test_name_template' {template!r}: {e}"
+        )
+
+    return BuildConfig(
+        library_rules=_ruleset("library_rules", DEFAULT_LIBRARY_RULES),
+        test_rules=_ruleset("test_rules", DEFAULT_TEST_RULES),
+        test_name_template=template,
+        rules=rules,
+    )
+
+
+# ---------------------------------------------------------------------------
+# BUILD file parsing
+# ---------------------------------------------------------------------------
 
 _TARGET_START_RE = re.compile(r"^(\w+)\s*\(")
 _NAME_RE = re.compile(r'\bname\s*=\s*"([^"]+)"')
@@ -72,6 +173,58 @@ def _is_suppressed(lines: list[str], line_idx: int, rule: str) -> bool:
     return False
 
 
+def _mask_line(line: str, triple: str) -> tuple[str, str]:
+    """Blank string-literal and comment content on one line, preserving length.
+
+    `triple` carries an open triple-quote (`'''`/`\"\"\"`) from a previous line,
+    or "" when not inside one. Returns (masked_line, new_triple). Masking lets
+    the paren counter ignore '(' / ')' / '#' that live inside strings or
+    comments, so target boundaries are found correctly.
+    """
+    out = []
+    i, n = 0, len(line)
+    if triple:  # continuation of a multi-line triple-quoted string
+        close = line.find(triple)
+        if close == -1:
+            return " " * n, triple
+        out.append(" " * (close + 3))
+        i = close + 3
+        triple = ""
+    while i < n:
+        c = line[i]
+        if c == "#":  # comment to end of line
+            out.append(" " * (n - i))
+            break
+        if c in ("'", '"'):
+            if line[i : i + 3] in ("'''", '"""'):
+                tq = line[i : i + 3]
+                close = line.find(tq, i + 3)
+                if close == -1:  # opens a multi-line triple
+                    out.append(" " * (n - i))
+                    return "".join(out), tq
+                out.append(" " * (close + 3 - i))
+                i = close + 3
+                continue
+            j = i + 1  # single-/double-quoted; scan to close, honor escapes
+            while j < n and line[j] != c:
+                j += 2 if line[j] == "\\" else 1
+            out.append(" " * (min(j, n - 1) - i + 1))
+            i = j + 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out), triple
+
+
+def _mask_strings_and_comments(lines: list[str]) -> list[str]:
+    """Mask every line, threading triple-quote state across line boundaries."""
+    masked, triple = [], ""
+    for line in lines:
+        m, triple = _mask_line(line, triple)
+        masked.append(m)
+    return masked
+
+
 @dataclass
 class TargetBlock:
     """A parsed Bazel target."""
@@ -83,18 +236,24 @@ class TargetBlock:
 
 
 def _parse_targets(lines: list[str]) -> list[TargetBlock]:
-    """Extract target blocks from BUILD file lines."""
+    """Extract target blocks from BUILD file lines.
+
+    Target detection and paren-depth tracking run on a string/comment-masked
+    copy so that parens inside literals or comments don't shift boundaries;
+    target names are still read from the original text.
+    """
+    masked = _mask_strings_and_comments(lines)
     targets = []
     i = 0
     while i < len(lines):
-        m = _TARGET_START_RE.match(lines[i])
+        m = _TARGET_START_RE.match(masked[i])
         if m:
             rule = m.group(1)
             start = i
             depth = 0
             j = i
             while j < len(lines):
-                depth += lines[j].count("(") - lines[j].count(")")
+                depth += masked[j].count("(") - masked[j].count(")")
                 if depth <= 0:
                     break
                 j += 1
@@ -117,15 +276,18 @@ def _parse_targets(lines: list[str]) -> list[TargetBlock]:
 
 
 def check_target_sort(
-    filepath: str, lines: list[str], fix: bool
+    filepath: str,
+    lines: list[str],
+    fix: bool,
+    library_rules: frozenset,
+    targets: list["TargetBlock"],
 ) -> tuple[list[Diagnostic], list[str]]:
     """Library targets must be alphabetically sorted by name."""
     rule = "build-target-sort"
     diags = []
     new_lines = list(lines)
 
-    targets = _parse_targets(lines)
-    lib_targets = [t for t in targets if t.rule in LIBRARY_RULES]
+    lib_targets = [t for t in targets if t.rule in library_rules]
 
     if len(lib_targets) < 2:
         return diags, new_lines
@@ -164,7 +326,7 @@ def check_target_sort(
     first_lib = lib_targets[0]
     last_lib = lib_targets[-1]
     for t in targets:
-        if t.rule not in LIBRARY_RULES and first_lib.start < t.start < last_lib.end:
+        if t.rule not in library_rules and first_lib.start < t.start < last_lib.end:
             return diags, new_lines
 
     # Extract each library target's lines and sort by name.
@@ -191,13 +353,18 @@ def check_target_sort(
 # ---------------------------------------------------------------------------
 
 
-def check_test_name(filepath: str, lines: list[str]) -> list[Diagnostic]:
-    """Test targets must be named {dirname}_unittests."""
+def check_test_name(
+    filepath: str,
+    lines: list[str],
+    test_rules: frozenset,
+    test_name_template: str,
+    targets: list["TargetBlock"],
+) -> list[Diagnostic]:
+    """Test targets must be named after the test-name template."""
     rule = "build-test-name"
     diags = []
 
-    targets = _parse_targets(lines)
-    test_targets = [t for t in targets if t.rule in TEST_RULES]
+    test_targets = [t for t in targets if t.rule in test_rules]
 
     if not test_targets:
         return diags
@@ -206,7 +373,7 @@ def check_test_name(filepath: str, lines: list[str]) -> list[Diagnostic]:
     if not dirname:
         return diags
 
-    expected = f"{dirname}_unittests"
+    expected = test_name_template.format(dirname=dirname)
 
     for t in test_targets:
         if t.name != expected:
@@ -219,7 +386,7 @@ def check_test_name(filepath: str, lines: list[str]) -> list[Diagnostic]:
                     rule=rule,
                     message=(
                         f'test target name "{t.name}" should be "{expected}" '
-                        f"(expected {{dirname}}_unittests)"
+                        f'(expected "{test_name_template}")'
                     ),
                 )
             )
@@ -228,18 +395,19 @@ def check_test_name(filepath: str, lines: list[str]) -> list[Diagnostic]:
 
 
 # ---------------------------------------------------------------------------
-# Rule registry & driver
+# Driver
 # ---------------------------------------------------------------------------
-
-ALL_RULES = ["build-target-sort", "build-test-name"]
 
 
 def lint_file(
     filepath: str,
     fix: bool = False,
     selected_rules: set[str] | None = None,
+    config: BuildConfig | None = None,
 ) -> list[Diagnostic]:
     """Lint a single BUILD file."""
+    if config is None:
+        config = BuildConfig()
     try:
         with open(filepath, encoding="utf-8", errors="replace") as f:
             content = f.read()
@@ -253,19 +421,36 @@ def lint_file(
     if lines and lines[-1] == "":
         lines = lines[:-1]
 
-    rules = set(ALL_RULES)
+    # Config enables a rule subset; --rules narrows it further.
+    rules = set(config.rules)
     if selected_rules is not None:
         rules &= selected_rules
 
     all_diags: list[Diagnostic] = []
     current_lines = lines
+    # Parse (and mask strings/comments) once; both checks share the result.
+    targets = _parse_targets(current_lines)
 
     if "build-target-sort" in rules:
-        diags, current_lines = check_target_sort(filepath, current_lines, fix)
+        diags, current_lines = check_target_sort(
+            filepath, current_lines, fix, config.library_rules, targets
+        )
         all_diags.extend(diags)
+        # A --fix sort rewrote the lines, shifting target offsets — re-parse so
+        # the next check sees correct positions.
+        if current_lines != lines:
+            targets = _parse_targets(current_lines)
 
     if "build-test-name" in rules:
-        all_diags.extend(check_test_name(filepath, current_lines))
+        all_diags.extend(
+            check_test_name(
+                filepath,
+                current_lines,
+                config.test_rules,
+                config.test_name_template,
+                targets,
+            )
+        )
 
     if fix and current_lines != lines:
         with open(filepath, "w", encoding="utf-8") as f:
@@ -278,7 +463,7 @@ def lint_file(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Fractal build lint — BUILD.bazel linter for ZKX",
+        description="Fractal build lint — BUILD.bazel linter",
     )
     parser.add_argument("files", nargs="*", help="BUILD files to lint")
     parser.add_argument(
@@ -288,7 +473,7 @@ def main(argv: list[str] | None = None) -> int:
         "--rules",
         type=str,
         default=None,
-        help="Comma-separated list of rules to run (default: all)",
+        help="Comma-separated list of rules to run (default: config/all)",
     )
     args = parser.parse_args(argv)
 
@@ -307,10 +492,21 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
 
+    try:
+        config = load_build_config()
+    except ValueError as e:
+        print(f"fractal-build-lint: {e}", file=sys.stderr)
+        return 1
+
     all_diags: list[Diagnostic] = []
     for filepath in args.files:
         all_diags.extend(
-            lint_file(filepath, fix=args.fix, selected_rules=selected_rules)
+            lint_file(
+                filepath,
+                fix=args.fix,
+                selected_rules=selected_rules,
+                config=config,
+            )
         )
 
     for d in all_diags:

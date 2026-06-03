@@ -116,6 +116,12 @@ class ScopeConfig:
     roots: list[str] = field(default_factory=list)
     dictionary: dict[str, str] = field(default_factory=dict)
     max_scope_depth: int = 2  # cap derived scope to N segments (0 = unlimited)
+    # Leading directory segments (after roots) that mirror the source tree, e.g.
+    # tests=["tests"] maps stablehlo/tests/transforms -> transforms so a test
+    # file shares its source's scope. Only the leading segment is dropped, so
+    # `tests` elsewhere in a path (and a real top-level `tests` source dir) are
+    # untouched — unlike a blanket `[dictionary] tests = ""`.
+    test_dirs: list[str] = field(default_factory=list)
 
 
 def _as_prefix_list(value) -> list[str]:
@@ -159,6 +165,7 @@ def load_scope_config(start_dir: str = ".") -> ScopeConfig | None:
         roots=sorted(_as_prefix_list(data.get("roots", [])), key=len, reverse=True),
         dictionary=dictionary,
         max_scope_depth=int(data.get("max_scope_depth", 2)),
+        test_dirs=_as_prefix_list(data.get("test_dirs", [])),
     )
 
 
@@ -258,7 +265,11 @@ def _derive_scope(directory: str, config: ScopeConfig) -> str:
     stripped = _strip_roots(directory, config.roots)
     if not stripped:
         return ""
-    segs = [t for s in stripped.split("/") if (t := _transform_segment(s, config))]
+    raw = stripped.split("/")
+    # A leading test-mirror segment (tests/...) maps to its source's scope.
+    if raw and raw[0] in config.test_dirs:
+        raw = raw[1:]
+    segs = [t for s in raw if (t := _transform_segment(s, config))]
     if config.max_scope_depth > 0:
         segs = segs[: config.max_scope_depth]
     return "/".join(segs)
@@ -307,13 +318,24 @@ def validate_scope(
     if not nonexempt:
         return []
 
-    common = posixpath.commonpath(nonexempt)
-    # commonpath returns one of the inputs only for a single file; otherwise it
-    # is their common directory. Purely structural (no filesystem access), so it
-    # is correct even when a commit deletes a directory or runs in a bare CI tree.
-    if common in nonexempt:
-        common = posixpath.dirname(common)
-    canonical = _derive_scope(common, config)
+    # Derive a scope per file (from its directory), then take their longest
+    # common prefix. This is the common ancestor *in scope space* — after roots
+    # stripping, test-mirror alignment, dictionary, and depth cap have applied —
+    # so a commit spanning a source dir and its parallel test mirror resolves to
+    # the shared scope (stablehlo/transforms/x.cpp + stablehlo/tests/transforms/
+    # y.mlir both derive to "transforms"), even at mismatched depths. A raw
+    # filesystem commonpath would instead collapse such a span to the bare root.
+    # Purely structural — no filesystem access, correct for deletes / bare CI.
+    seg_lists = [
+        s.split("/") if (s := _derive_scope(posixpath.dirname(f), config)) else []
+        for f in nonexempt
+    ]
+    prefix: list[str] = []
+    for segs in zip(*seg_lists):
+        if len(set(segs)) != 1:
+            break
+        prefix.append(segs[0])
+    canonical = "/".join(prefix)
 
     if scope == canonical:
         return []

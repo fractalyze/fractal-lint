@@ -285,6 +285,73 @@ class CanonicalDeriveTest(unittest.TestCase):
                                       ["prime_ir/Dialect/Field/gone.cc"])), [])
 
 
+class SourceTestSpanTest(unittest.TestCase):
+    """Issue #4: a commit spanning a source dir and its parallel test mirror
+    derives one scope. Per-file derivation + a `test_dirs` leading-mirror strip
+    map the test file to its source's scope, where a commonpath-first derivation
+    would collapse to the empty scope."""
+
+    CFG = fcl.ScopeConfig(
+        scopes={},
+        exempt_paths=["third_party"],
+        require_scope=False,
+        roots=["stablehlo"],
+        test_dirs=["tests"],
+    )
+
+    def _v(self, scope, files):
+        return sorted(d.rule for d in fcl.validate_scope(scope, self.CFG, files))
+
+    def test_source_plus_test_mirror(self):
+        self.assertEqual(
+            self._v(
+                "transforms",
+                ["stablehlo/transforms/b.cpp", "stablehlo/tests/transforms/b.mlir"],
+            ),
+            [],
+        )
+
+    def test_tests_mirror_only(self):
+        self.assertEqual(
+            self._v("transforms", ["stablehlo/tests/transforms/a.mlir"]), []
+        )
+
+    def test_mirror_at_mismatched_depth(self):
+        # Test file one dir deeper than its source sibling: the source+test
+        # span still resolves via the common scope *prefix* ([transforms] vs
+        # [transforms, sub]), where a raw commonpath would collapse to "".
+        self.assertEqual(
+            self._v(
+                "transforms",
+                ["stablehlo/transforms/x.cpp", "stablehlo/tests/transforms/sub/y.mlir"],
+            ),
+            [],
+        )
+
+    def test_strips_only_leading_mirror_segment(self):
+        # test_dirs strips a *leading* mirror segment (prefix-mirror layout);
+        # a non-leading 'tests' is left in the path — NOT globally erased the
+        # way `[dictionary] tests = ""` would be. (A co-located nested test
+        # dir, source/tests/..., is a different layout this does not collapse
+        # to the source scope; out of scope for #4.)
+        self.assertEqual(
+            fcl._derive_scope("stablehlo/tests/transforms", self.CFG), "transforms"
+        )
+        self.assertEqual(
+            fcl._derive_scope("stablehlo/transforms/tests", self.CFG),
+            "transforms/tests",
+        )
+
+    def test_genuinely_cross_scope_still_rejected(self):
+        self.assertIn(
+            "scope-enum",
+            self._v(
+                "transforms",
+                ["stablehlo/transforms/a.cpp", "stablehlo/dialect/b.cpp"],
+            ),
+        )
+
+
 class RootsOrderTest(unittest.TestCase):
     def test_longest_root_wins(self):
         import tempfile, os

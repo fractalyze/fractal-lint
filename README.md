@@ -1,7 +1,7 @@
 # fractal-lint
 
-Custom style linter for ZKX C++ code. Enforces project-specific rules not
-covered by clang-format, cpplint, or clang-tidy.
+Custom C++ style linter. Enforces project-specific rules not covered by
+clang-format, cpplint, or clang-tidy.
 
 ## Rules
 
@@ -38,6 +38,20 @@ fractal-lint --fix file1.cc
 fractal-lint --rules=abseil-string-view,nolint-type file1.cc
 ```
 
+### Per-repo config (optional)
+
+By default all rules run. A repo can enable just a subset with a
+`.fractal-lint.toml` at its root (resolved from the current working directory),
+so it can adopt the linter incrementally without passing `--rules` every run:
+
+```toml
+# Only these rules run; omit the file to run all.
+rules = ["license-header", "redundant-include"]
+```
+
+`--rules` on the CLI narrows further within the enabled set. With no config
+file, behavior is unchanged (all rules).
+
 ## Commit message linting (`fractal-commit-lint`)
 
 Enforces Conventional Commits at the `commit-msg` stage: a valid type, a
@@ -70,6 +84,16 @@ The derived scope is capped at `max_scope_depth` segments (default 2), so a
 deeply nested file still yields a short scope (`dialect/ec`) rather than the
 whole path.
 
+Each file derives its own scope; the commit is accepted when they all agree (or
+match an alias). This lets one commit span a source dir and its **parallel test
+mirror** — `test_dirs = ["tests"]` strips a *leading* mirror segment so
+`stablehlo/tests/transforms/x.mlir` derives to `transforms`, the same as
+`stablehlo/transforms/x.cpp`. Only the **leading** segment is stripped, so a
+non-leading `tests` is left in the path rather than globally erased the way
+`[dictionary] tests = ""` would erase it. (This targets the prefix-mirror layout
+`tests/<source-path>`; a co-located `source/tests/...` is a different layout and
+is not collapsed to the source scope.)
+
 **Explicit `[scopes]`** aliases cover what derivation can't express —
 abbreviations (`se` → `xla/stream_executor`), multi-directory groupings (`cpu` →
 `backends/cpu` + `service/cpu`), root-level concept scopes. Aliases are
@@ -77,6 +101,7 @@ abbreviations (`se` → `xla/stream_executor`), multi-directory groupings (`cpu`
 
 ```toml
 roots = ["prime_ir"]                          # stripped before deriving
+test_dirs = ["tests"]                          # leading test-mirror dirs → source scope
 exempt_paths = ["WORKSPACE", "third_party"]   # cross-cutting, skipped by scope checks
 require_scope = false                          # set true to make scope mandatory
 max_scope_depth = 2                            # cap derived scope to N segments (0 = unlimited)
@@ -107,6 +132,36 @@ and the check is skipped. Repos without the config file are unaffected.
 Dictionary values must be lowercase, and two segments mapping to the same token
 are flagged as a load-time warning (the scope would no longer name one
 component); neither fails the run.
+
+## BUILD linting (`fractal-build-lint`)
+
+A `BUILD.bazel` linter (runs at the `pre-commit` stage on `BUILD`/`BUILD.bazel`):
+
+| Rule | Description | Fix |
+| --- | --- | --- |
+| `build-target-sort` | Library targets sorted alphabetically by name | Yes |
+| `build-test-name` | Test targets named after the test-name template | No |
+
+### Per-repo config (optional)
+
+By default only the native `cc_library`/`cc_test` (and legacy `zkx_*`) rules are
+recognized. A repo using its own Bazel macros points the linter at them with a
+`.fractal-build-lint.toml` at the repo root:
+
+```toml
+# Rule names build-target-sort orders.
+library_rules = ["cc_library", "prime_ir_cc_library"]
+# Rule names build-test-name checks.
+test_rules = ["prime_ir_cc_test"]
+# Expected test target name; {dirname} = the BUILD file's directory.
+test_name_template = "{dirname}_unittests"
+# Optional: enabled-rule subset (omit to run all). A repo whose test naming
+# doesn't fit the template can run only the sort rule.
+rules = ["build-target-sort"]
+```
+
+With no config file the defaults apply, so existing repos are unaffected. See
+[docs/build-lint-config.md](docs/build-lint-config.md).
 
 ## Suppression
 
