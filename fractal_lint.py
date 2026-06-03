@@ -14,10 +14,12 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Fractal lint — custom style linter for ZKX.
+"""Fractal lint — custom C++ style linter.
 
-Enforces project-specific rules from .gemini/styleguide.md that are not covered
-by clang-format, cpplint, or clang-tidy.
+Enforces project-specific rules not covered by clang-format, cpplint, or
+clang-tidy. Which rules run is configurable per repo via a `.fractal-lint.toml`
+at the repo root (default: all rules), so a repo can adopt the linter with only
+the subset it wants.
 
 Usage:
     fractal-lint [--fix] [--rules=rule1,rule2] file1.cc file2.h ...
@@ -27,7 +29,17 @@ import argparse
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # pragma: no cover - exercised on 3.10
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ModuleNotFoundError:  # pragma: no cover
+        tomllib = None  # type: ignore[assignment]
+
+CONFIG_FILENAME = ".fractal-lint.toml"
 
 # ---------------------------------------------------------------------------
 # Diagnostics
@@ -836,17 +848,76 @@ BAZEL_NAMES = {"BUILD.bazel", "BUILD"}
 BAZEL_EXTENSIONS = {".bzl"}
 
 
-def _applicable_rules(filepath: str, selected_rules: set[str] | None) -> set[str]:
-    """Determine which rules apply to this file."""
+@dataclass
+class LintConfig:
+    """Repo-local fractal-lint policy from .fractal-lint.toml.
+
+    * rules: enabled-rule subset (default all). Lets a repo adopt the linter
+      with only the rules it wants instead of passing --rules every run.
+    """
+
+    rules: list = field(default_factory=lambda: list(ALL_RULES))
+
+
+def load_lint_config(start_dir: str = ".") -> LintConfig:
+    """Load fractal-lint policy from the nearest .fractal-lint.toml.
+
+    Returns defaults (all rules) when no config file is present, preserving
+    pre-config behavior.
+    """
+    path = os.path.join(start_dir, CONFIG_FILENAME)
+    if not os.path.isfile(path):
+        return LintConfig()
+    if tomllib is None:  # pragma: no cover - depends on interpreter
+        print(
+            f"fractal-lint: {CONFIG_FILENAME} found but no TOML parser "
+            "available; install 'tomli' on Python < 3.11 to enable config",
+            file=sys.stderr,
+        )
+        return LintConfig()
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+
+    if "rules" not in data:
+        return LintConfig()
+    rules = data["rules"]
+    # Reject a bare string/non-list: iterating a str would silently yield one
+    # "rule" per character instead of a clear config error.
+    if not isinstance(rules, list):
+        raise ValueError(f"{CONFIG_FILENAME}: 'rules' must be a list of strings")
+    rules = [str(r) for r in rules]
+    unknown = set(rules) - set(ALL_RULES)
+    if unknown:
+        raise ValueError(
+            f"{CONFIG_FILENAME}: unknown rules {sorted(unknown)}; "
+            f"available: {ALL_RULES}"
+        )
+    return LintConfig(rules=rules)
+
+
+def _applicable_rules(
+    filepath: str,
+    selected_rules: set[str] | None,
+    enabled_rules: set[str] | None = None,
+) -> set[str]:
+    """Determine which rules apply to this file.
+
+    `enabled_rules` is the repo's config-enabled set (defaults to all rules).
+    `selected_rules` is the CLI `--rules` narrowing on top of that.
+    """
+    if enabled_rules is None:
+        enabled_rules = set(ALL_RULES)
+
     ext = os.path.splitext(filepath)[1]
     basename = os.path.basename(filepath)
 
     applicable = set()
 
     if ext in CPP_EXTENSIONS:
-        applicable.update(ALL_RULES)
+        applicable.update(enabled_rules)
     if basename in BAZEL_NAMES or ext in BAZEL_EXTENSIONS:
-        applicable.add("license-header")
+        if "license-header" in enabled_rules:
+            applicable.add("license-header")
 
     if selected_rules is not None:
         applicable &= selected_rules
@@ -863,9 +934,10 @@ def lint_file(
     filepath: str,
     fix: bool = False,
     selected_rules: set[str] | None = None,
+    enabled_rules: set[str] | None = None,
 ) -> list[Diagnostic]:
     """Lint a single file. If fix=True, write auto-fixed content back."""
-    rules = _applicable_rules(filepath, selected_rules)
+    rules = _applicable_rules(filepath, selected_rules, enabled_rules)
     if not rules:
         return []
 
@@ -926,7 +998,7 @@ def lint_file(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Fractal lint — custom style linter for ZKX",
+        description="Fractal lint — custom style linter",
     )
     parser.add_argument(
         "files",
@@ -942,7 +1014,7 @@ def main(argv: list[str] | None = None) -> int:
         "--rules",
         type=str,
         default=None,
-        help="Comma-separated list of rules to run (default: all)",
+        help="Comma-separated list of rules to run (default: config/all)",
     )
     args = parser.parse_args(argv)
 
@@ -961,10 +1033,22 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
 
+    try:
+        config = load_lint_config()
+    except ValueError as e:
+        print(f"fractal-lint: {e}", file=sys.stderr)
+        return 1
+    enabled_rules = set(config.rules)
+
     all_diags: list[Diagnostic] = []
     for filepath in args.files:
         all_diags.extend(
-            lint_file(filepath, fix=args.fix, selected_rules=selected_rules)
+            lint_file(
+                filepath,
+                fix=args.fix,
+                selected_rules=selected_rules,
+                enabled_rules=enabled_rules,
+            )
         )
 
     for d in all_diags:
