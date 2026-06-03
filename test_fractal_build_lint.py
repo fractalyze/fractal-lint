@@ -110,6 +110,47 @@ class TargetSortTest(unittest.TestCase):
             self.assertEqual(_rules(fbl.lint_file(p)), ["build-target-sort"])
 
 
+class ParserRobustnessTest(unittest.TestCase):
+    """Parens/'#' inside strings or comments must not shift target boundaries."""
+
+    def test_unbalanced_paren_in_string(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                d,
+                "BUILD.bazel",
+                'cc_library(name = "zzz", copts = ["-DX=foo("])\n'
+                'cc_library(name = "aaa")\n',
+            )
+            self.assertEqual(_rules(fbl.lint_file(p)), ["build-target-sort"])
+
+    def test_paren_in_comment(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                d,
+                "BUILD.bazel",
+                'cc_library(name = "zzz")  # note: foo( bar\n'
+                'cc_library(name = "aaa")\n',
+            )
+            self.assertEqual(_rules(fbl.lint_file(p)), ["build-target-sort"])
+
+    def test_triple_quoted_multiline_parens(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                d,
+                "BUILD.bazel",
+                'cc_library(name = "zzz")\n\n'
+                "genrule(\n"
+                '    name = "g",\n'
+                '    cmd = """\n'
+                "        echo (unbalanced ( parens ) here\n"
+                '    """,\n'
+                ")\n\n"
+                'cc_library(name = "aaa")\n',
+            )
+            # The genrule block is parsed as one unit; both libs are still seen.
+            self.assertEqual(_rules(fbl.lint_file(p)), ["build-target-sort"])
+
+
 class TestNameTest(unittest.TestCase):
     def _build(self, d, rule, name):
         sub = os.path.join(d, "mymod")

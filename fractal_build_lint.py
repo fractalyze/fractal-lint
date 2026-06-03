@@ -173,6 +173,58 @@ def _is_suppressed(lines: list[str], line_idx: int, rule: str) -> bool:
     return False
 
 
+def _mask_line(line: str, triple: str) -> tuple[str, str]:
+    """Blank string-literal and comment content on one line, preserving length.
+
+    `triple` carries an open triple-quote (`'''`/`\"\"\"`) from a previous line,
+    or "" when not inside one. Returns (masked_line, new_triple). Masking lets
+    the paren counter ignore '(' / ')' / '#' that live inside strings or
+    comments, so target boundaries are found correctly.
+    """
+    out = []
+    i, n = 0, len(line)
+    if triple:  # continuation of a multi-line triple-quoted string
+        close = line.find(triple)
+        if close == -1:
+            return " " * n, triple
+        out.append(" " * (close + 3))
+        i = close + 3
+        triple = ""
+    while i < n:
+        c = line[i]
+        if c == "#":  # comment to end of line
+            out.append(" " * (n - i))
+            break
+        if c in ("'", '"'):
+            if line[i : i + 3] in ("'''", '"""'):
+                tq = line[i : i + 3]
+                close = line.find(tq, i + 3)
+                if close == -1:  # opens a multi-line triple
+                    out.append(" " * (n - i))
+                    return "".join(out), tq
+                out.append(" " * (close + 3 - i))
+                i = close + 3
+                continue
+            j = i + 1  # single-/double-quoted; scan to close, honor escapes
+            while j < n and line[j] != c:
+                j += 2 if line[j] == "\\" else 1
+            out.append(" " * (min(j, n - 1) - i + 1))
+            i = j + 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out), triple
+
+
+def _mask_strings_and_comments(lines: list[str]) -> list[str]:
+    """Mask every line, threading triple-quote state across line boundaries."""
+    masked, triple = [], ""
+    for line in lines:
+        m, triple = _mask_line(line, triple)
+        masked.append(m)
+    return masked
+
+
 @dataclass
 class TargetBlock:
     """A parsed Bazel target."""
@@ -184,18 +236,24 @@ class TargetBlock:
 
 
 def _parse_targets(lines: list[str]) -> list[TargetBlock]:
-    """Extract target blocks from BUILD file lines."""
+    """Extract target blocks from BUILD file lines.
+
+    Target detection and paren-depth tracking run on a string/comment-masked
+    copy so that parens inside literals or comments don't shift boundaries;
+    target names are still read from the original text.
+    """
+    masked = _mask_strings_and_comments(lines)
     targets = []
     i = 0
     while i < len(lines):
-        m = _TARGET_START_RE.match(lines[i])
+        m = _TARGET_START_RE.match(masked[i])
         if m:
             rule = m.group(1)
             start = i
             depth = 0
             j = i
             while j < len(lines):
-                depth += lines[j].count("(") - lines[j].count(")")
+                depth += masked[j].count("(") - masked[j].count(")")
                 if depth <= 0:
                     break
                 j += 1
