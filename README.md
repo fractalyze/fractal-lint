@@ -1,7 +1,7 @@
 # fractal-lint
 
-Custom style linter for ZKX C++ code. Enforces project-specific rules not
-covered by clang-format, cpplint, or clang-tidy.
+Custom C++ style linter. Enforces project-specific rules not covered by
+clang-format, cpplint, or clang-tidy.
 
 ## Rules
 
@@ -37,6 +37,20 @@ fractal-lint --fix file1.cc
 # Run specific rules only
 fractal-lint --rules=abseil-string-view,nolint-type file1.cc
 ```
+
+### Per-repo config (optional)
+
+By default all rules run. A repo can enable just a subset with a
+`.fractal-lint.toml` at its root (resolved from the current working directory),
+so it can adopt the linter incrementally without passing `--rules` every run:
+
+```toml
+# Only these rules run; omit the file to run all.
+rules = ["license-header", "redundant-include"]
+```
+
+`--rules` on the CLI narrows further within the enabled set. With no config
+file, behavior is unchanged (all rules).
 
 ## Commit message linting (`fractal-commit-lint`)
 
