@@ -84,6 +84,16 @@ The derived scope is capped at `max_scope_depth` segments (default 2), so a
 deeply nested file still yields a short scope (`dialect/ec`) rather than the
 whole path.
 
+Each file derives its own scope; the commit is accepted when they all agree (or
+match an alias). This lets one commit span a source dir and its **parallel test
+mirror** — `test_dirs = ["tests"]` strips a *leading* mirror segment so
+`stablehlo/tests/transforms/x.mlir` derives to `transforms`, the same as
+`stablehlo/transforms/x.cpp`. Only the **leading** segment is stripped, so a
+non-leading `tests` is left in the path rather than globally erased the way
+`[dictionary] tests = ""` would erase it. (This targets the prefix-mirror layout
+`tests/<source-path>`; a co-located `source/tests/...` is a different layout and
+is not collapsed to the source scope.)
+
 **Explicit `[scopes]`** aliases cover what derivation can't express —
 abbreviations (`se` → `xla/stream_executor`), multi-directory groupings (`cpu` →
 `backends/cpu` + `service/cpu`), root-level concept scopes. Aliases are
@@ -91,6 +101,7 @@ abbreviations (`se` → `xla/stream_executor`), multi-directory groupings (`cpu`
 
 ```toml
 roots = ["prime_ir"]                          # stripped before deriving
+test_dirs = ["tests"]                          # leading test-mirror dirs → source scope
 exempt_paths = ["WORKSPACE", "third_party"]   # cross-cutting, skipped by scope checks
 require_scope = false                          # set true to make scope mandatory
 max_scope_depth = 2                            # cap derived scope to N segments (0 = unlimited)
